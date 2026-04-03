@@ -1,14 +1,15 @@
-# shufflon-pipeline
+# shufflonfinder
 
-A pipeline for annotating shufflon structures in bacterial genomes. It searches predicted proteins against a library of shufflon-associated HMM profiles, extracts flanking DNA around each hit, scans those flanking regions for inverted repeats, and produces merged GFF annotations with windowed output for each candidate shufflon locus.
+Annotate shufflon structures in bacterial genomes. Searches predicted proteins against a library of shufflon-associated HMM profiles, extracts flanking DNA around each hit, scans those flanking regions for inverted repeats, and produces merged GFF annotations with windowed output for each candidate shufflon locus.
+
 
 ## How it works
 
 The pipeline runs six steps in sequence:
 
-1. **Prokka** annotates raw genome FASTAs to produce protein sequences (.faa), gene coordinates (.gff), and contigs (.fna). This step is skipped when you supply pre-annotated inputs via a sample sheet.
+1. **Prokka** annotates raw genome FASTAs to produce protein sequences (.faa), gene coordinates (.gff), and contigs (.fna). Skipped when you supply pre-annotated inputs via a sample sheet.
 
-2. **HMM search** decompresses all `.hmm.gz` profiles from the `hmms/` directory, prepares them with `hmmpress`, and runs `hmmsearch` for each profile against each sample's proteins. Results are pooled and filtered by a bitscore threshold. Proteins matching multiple profiles are deduplicated so each protein produces one entry (with all matching profiles recorded).
+2. **HMM search** decompresses all `.hmm.gz` profiles from the bundled `hmms/` directory, prepares them with `hmmpress`, and runs `hmmsearch` for each profile against each sample's proteins. Results are pooled and filtered by a bitscore threshold. Proteins matching multiple profiles are deduplicated so each protein produces one entry (with all matching profiles recorded).
 
 3. **Flanking extraction** maps each hit protein back to its genomic coordinates through the Prokka GFF, then pulls ±5 kb of DNA (configurable) from the genome FASTA on each side of the CDS. The output is a multi-record FASTA plus a metadata TSV tracking the coordinate mappings.
 
@@ -21,18 +22,18 @@ The pipeline runs six steps in sequence:
 
 ## Prerequisites
 
-You need [conda](https://docs.conda.io/en/latest/) or [mamba](https://mamba.readthedocs.io/) installed. All other dependencies are handled by the environment file.
+[Conda](https://docs.conda.io/en/latest/) or [mamba](https://mamba.readthedocs.io/). Everything else is installed automatically.
 
-External tools installed via conda:
+External tools (installed via conda):
 
-- [Prokka](https://github.com/tseemann/prokka) >= 1.14 (gene annotation)
-- [HMMER](http://hmmer.org/) >= 3.3 (`hmmsearch`, `hmmpress`)
+- [Prokka](https://github.com/tseemann/prokka) >= 1.14
+- [HMMER](http://hmmer.org/) >= 3.3
 
 Installed via pip inside the conda environment:
 
-- [PHAVA](https://github.com/Matteopaluh/PHAVA) (inverted repeat detection)
+- [PHAVA](https://github.com/Matteopaluh/PHAVA)
 
-Python libraries (conda):
+Python libraries (installed via conda):
 
 - Python >= 3.9
 - Biopython >= 1.80
@@ -41,41 +42,50 @@ Python libraries (conda):
 
 ## Installation
 
-Clone the repository and create the conda environment:
-
 ```bash
-git clone https://github.com/your-org/shufflon-pipeline.git
-cd shufflon-pipeline
+git clone https://github.com/your-org/shufflonfinder.git
+cd shufflonfinder
 
 conda env create -f environment.yml
-conda activate shufflon-pipeline
+conda activate shufflonfinder
 ```
 
-Verify the tools are available:
+The `environment.yml` installs all conda packages, pip packages, and shufflonfinder itself (via `pip install -e .`) in one step. After activation, the `shufflonfinder` command is available on your PATH.
+
+Verify everything installed correctly:
 
 ```bash
+shufflonfinder --help
 prokka --version
 hmmsearch -h | head -1
 phava --help
 ```
 
-The 41 HMM profiles in `hmms/` ship with the repository. No additional downloads are needed.
+The 41 HMM profiles ship with the package in `shufflonfinder/hmms/`. No additional downloads are needed.
+
+
+## Quick start
+
+```bash
+# Single genome
+shufflonfinder --input-fasta my_genome.fna --outdir results/
+
+# Directory of genomes, 8 threads per tool
+shufflonfinder --input-fasta genomes/ --outdir results/ --cpus 8
+
+# Pre-annotated samples (skip Prokka)
+shufflonfinder --sample-sheet samples.tsv --outdir results/
+```
 
 
 ## Usage
 
 ### From raw genome FASTAs
 
-Pass a single FASTA or a directory of FASTAs. Prokka runs automatically.
+Pass a single FASTA file or a directory of FASTAs. Prokka runs automatically.
 
 ```bash
-# Single genome
-python bin/run_pipeline.py \
-    --input-fasta my_genome.fna \
-    --outdir results/
-
-# Directory of genomes
-python bin/run_pipeline.py \
+shufflonfinder \
     --input-fasta genomes/ \
     --outdir results/ \
     --cpus 8
@@ -85,7 +95,7 @@ Recognized FASTA extensions: `.fasta`, `.fa`, `.fna` (and `.gz` versions of each
 
 ### From pre-annotated samples
 
-If Prokka (or a compatible annotator) has already been run, provide a tab-separated sample sheet:
+If Prokka (or a compatible annotator) has already been run, provide a tab-separated sample sheet with these columns:
 
 ```
 sample_id	fna_path	faa_path	gff_path
@@ -94,7 +104,7 @@ genome_002	/data/genome_002.fna	/data/genome_002.faa	/data/genome_002.gff
 ```
 
 ```bash
-python bin/run_pipeline.py \
+shufflonfinder \
     --sample-sheet samples.tsv \
     --outdir results/
 ```
@@ -103,10 +113,10 @@ All paths in the sample sheet must be absolute or resolvable from the working di
 
 ### Custom HMM profiles
 
-To use your own profiles instead of (or in addition to) the bundled set:
+To use your own profiles instead of the bundled set:
 
 ```bash
-python bin/run_pipeline.py \
+shufflonfinder \
     --input-fasta genomes/ \
     --hmm-dir /path/to/my_hmms/ \
     --outdir results/
@@ -121,7 +131,7 @@ The directory can contain `.hmm` or `.hmm.gz` files. Each file should hold one H
 --input-fasta PATH    Genome FASTA file or directory (mutually exclusive with --sample-sheet)
 --sample-sheet PATH   TSV with columns: sample_id, fna_path, faa_path, gff_path
 --outdir PATH         Output directory (required)
---hmm-dir PATH        Directory of .hmm/.hmm.gz profiles (default: hmms/ in the repo)
+--hmm-dir PATH        Directory of .hmm/.hmm.gz profiles (default: bundled profiles)
 --cpus INT            Threads per tool invocation (default: 4)
 --bitscore FLOAT      Minimum HMM bitscore to keep a hit (default: 25.0)
 --flank-bp INT        DNA to extract on each side of a hit protein, in bp (default: 5000)
@@ -163,12 +173,12 @@ results/
 
 `04_phava/IRs_combined_remapped.tsv` contains all detected inverted repeats with coordinates translated back to the original contigs.
 
-`06_shufflon_windows/` holds the final output: one GFF+FASTA file per candidate shufflon region, each containing the IR features, overlapping CDS features, and the corresponding DNA sequence.
+`06_shufflon_windows/` holds the final output: one GFF+FASTA file per candidate shufflon region, containing IR features, overlapping CDS features, and the corresponding DNA sequence.
 
 
 ## HMM profiles
 
-The bundled `hmms/` directory contains 41 profiles from Pfam, PANTHER, TIGRFAM, Gene3D, PIRSF, and other databases, selected for their association with shufflon recombinases, pilus tip adhesins, and related mobile genetic element components.
+The bundled profiles (41 total) come from Pfam, PANTHER, TIGRFAM, Gene3D, PIRSF, and other databases, selected for their association with shufflon recombinases, pilus tip adhesins, and related mobile genetic element components.
 
 A protein counts as a hit if it scores at or above `--bitscore` against any profile. Proteins matching multiple profiles are deduplicated at the flanking extraction step so each genomic locus is scanned for IRs exactly once.
 
@@ -176,20 +186,22 @@ A protein counts as a hit if it scores at or above `--bitscore` against any prof
 ## Project layout
 
 ```
-shufflon-pipeline/
-├── bin/
-│   └── run_pipeline.py        # CLI entry point
-├── lib/
-│   ├── utils.py               # Logging, shell commands, path helpers
-│   ├── sample_sheet.py        # Input parsing (FASTA, sample sheet)
-│   ├── step_prokka.py         # Prokka wrapper
-│   ├── step_hmmsearch.py      # Multi-profile HMM search
-│   ├── step_flanking.py       # Flanking DNA extraction + deduplication
-│   ├── step_phava.py          # PHAVA wrapper + coordinate remapping
-│   ├── step_ir_cds.py         # IR-CDS containment annotation
-│   └── step_gff.py            # GFF generation, merging, window extraction
-├── hmms/                      # Bundled HMM profiles (.hmm.gz)
-├── environment.yml            # Conda + pip environment
+shufflonfinder/
+├── shufflonfinder/              # Python package
+│   ├── __init__.py
+│   ├── cli.py                   # CLI entry point (console_scripts)
+│   ├── utils.py                 # Logging, shell commands, path helpers
+│   ├── sample_sheet.py          # Input parsing (FASTA, sample sheet)
+│   ├── step_prokka.py           # Prokka wrapper
+│   ├── step_hmmsearch.py        # Multi-profile HMM search
+│   ├── step_flanking.py         # Flanking DNA extraction + deduplication
+│   ├── step_phava.py            # PHAVA wrapper + coordinate remapping
+│   ├── step_ir_cds.py           # IR-CDS containment annotation
+│   ├── step_gff.py              # GFF generation, merging, window extraction
+│   └── hmms/                    # Bundled HMM profiles (.hmm.gz)
+├── pyproject.toml               # Package metadata + console_scripts
+├── environment.yml              # Conda + pip environment
+├── README.md
 └── .gitignore
 ```
 
