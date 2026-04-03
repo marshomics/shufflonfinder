@@ -1,6 +1,6 @@
 # shufflonfinder
 
-Annotate shufflon structures in bacterial genomes. Searches predicted proteins against a library of shufflon-associated HMM profiles, extracts flanking DNA around each hit, scans those flanking regions for inverted repeats, and produces merged GFF annotations with windowed output for each candidate shufflon locus.
+Annotate shufflon structures in bacterial genomes. Searches predicted proteins against a library of shufflon-associated HMM profiles, extracts flanking DNA around each hit, detects inverted repeats in those flanking regions using EMBOSS einverted, and produces merged GFF annotations with windowed output for each candidate shufflon locus.
 
 
 ## How it works
@@ -13,7 +13,7 @@ The pipeline runs six steps in sequence:
 
 3. **Flanking extraction** maps each hit protein back to its genomic coordinates through the Prokka GFF, then pulls ±5 kb of DNA (configurable) from the genome FASTA on each side of the CDS. The output is a multi-record FASTA plus a metadata TSV tracking the coordinate mappings.
 
-4. **PHAVA** runs `phava locate` and `phava summarize` on the flanking FASTAs rather than on whole genomes. IR coordinates are then translated from flanking-region-local back to genome-absolute positions.
+4. **Inverted repeat detection** runs EMBOSS `einverted` at two sensitivity thresholds (51 and 75) on the flanking FASTAs, merges the results with overlap deduplication, extracts arm sequences, and computes percent identity between arms. IR coordinates are then translated from flanking-region-local back to genome-absolute positions.
 
 5. **GFF generation and merging** converts both HMM hits and IRs into GFF3 features, then inserts them into the Prokka GFF between the annotation lines and the embedded FASTA section.
 
@@ -28,10 +28,7 @@ External tools (installed via conda):
 
 - [Prokka](https://github.com/tseemann/prokka) >= 1.14
 - [HMMER](http://hmmer.org/) >= 3.3
-
-Installed via pip inside the conda environment:
-
-- [PHAVA](https://github.com/Matteopaluh/PHAVA)
+- [EMBOSS](http://emboss.sourceforge.net/) >= 6.6 (provides `einverted`)
 
 Python libraries (installed via conda):
 
@@ -58,7 +55,7 @@ Verify everything installed correctly:
 shufflonfinder --help
 prokka --version
 hmmsearch -h | head -1
-phava --help
+einverted --help
 ```
 
 The 41 HMM profiles ship with the package in `shufflonfinder/hmms/`. No additional downloads are needed.
@@ -136,6 +133,8 @@ The directory can contain `.hmm` or `.hmm.gz` files. Each file should hold one H
 --bitscore FLOAT      Minimum HMM bitscore to keep a hit (default: 25.0)
 --flank-bp INT        DNA to extract on each side of a hit protein, in bp (default: 5000)
 --window-size INT     Max distance in bp for clustering nearby IRs (default: 3000)
+--min-ir-arm-length INT  Minimum IR arm length in bp to keep (default: 10)
+--min-ir-identity FLOAT  Minimum percent identity between IR arms (default: 70.0)
 --skip-prokka         Skip Prokka even for FASTA inputs
 -v                    Verbose output (use -vv for debug)
 -q                    Quiet mode (errors only)
@@ -154,15 +153,16 @@ results/
 ├── 03_flanking/
 │   ├── <sample_id>_flanking.fasta  # Flanking DNA around each hit protein
 │   └── flanking_regions_combined.tsv
-├── 04_phava/
-│   ├── <sample_id>/                # PHAVA output per sample
+├── 04_inverted_repeats/
+│   ├── <sample_id>/                # einverted output + IRs.tsv per sample
 │   └── IRs_combined_remapped.tsv   # IRs in genome-absolute coordinates
 ├── 05_gff/
 │   ├── hmm_hits/                   # HMM hit CDS features as GFF
 │   ├── ir/                         # IR features as GFF
 │   └── merged/                     # Prokka + HMM + IR merged GFFs
-└── 06_shufflon_windows/            # Windowed GFF+FASTA per candidate locus
-    └── <sample_id>/
+└── 06_shufflon_windows/
+    ├── shufflon_windows_summary.tsv  # Combined summary table (all samples)
+    └── <sample_id>/                  # Per-window GFF+FASTA files
 ```
 
 ### Key output files
@@ -171,9 +171,11 @@ results/
 
 `03_flanking/flanking_regions_combined.tsv` records the genomic coordinates of each flanking region, the CDS it surrounds, which HMM profiles matched, and the extracted sequence length.
 
-`04_phava/IRs_combined_remapped.tsv` contains all detected inverted repeats with coordinates translated back to the original contigs.
+`04_inverted_repeats/IRs_combined_remapped.tsv` contains all detected inverted repeats with coordinates translated back to the original contigs, plus arm sequences and percent identity.
 
-`06_shufflon_windows/` holds the final output: one GFF+FASTA file per candidate shufflon region, containing IR features, overlapping CDS features, and the corresponding DNA sequence.
+`06_shufflon_windows/shufflon_windows_summary.tsv` is the main results table. Each row represents one CDS feature within a candidate shufflon window. Columns include `sample_id`, `window_id`, `contig`, `window_start`, `window_end`, `window_length_bp`, `n_ir_pairs`, `ir_coords` (compact coordinate string for all IR pairs in the window), `locus_tag` (Prokka ID), `cds_start`, `cds_end`, `strand`, `product` (Prokka annotation), `cds_source`, and `gff_path` (path to the per-window GFF+FASTA file).
+
+`06_shufflon_windows/<sample_id>/` contains one GFF+FASTA file per candidate shufflon region, with IR features, overlapping CDS features, and the corresponding DNA sequence.
 
 
 ## HMM profiles
@@ -181,6 +183,25 @@ results/
 The bundled profiles (41 total) come from Pfam, PANTHER, TIGRFAM, Gene3D, PIRSF, and other databases, selected for their association with shufflon recombinases, pilus tip adhesins, and related mobile genetic element components.
 
 A protein counts as a hit if it scores at or above `--bitscore` against any profile. Proteins matching multiple profiles are deduplicated at the flanking extraction step so each genomic locus is scanned for IRs exactly once.
+
+
+## Inverted repeat filtering
+
+einverted is run at two sensitivity thresholds (51 and 75) with different scoring matrices. Results from both runs are merged, with threshold-75 hits taking priority: threshold-51 hits are only kept if they don't overlap any threshold-75 hit on the same contig. A hardcoded minimum of 30 bp between the two arms filters out trivially close pairs.
+
+After detection, two configurable filters are applied:
+
+`--min-ir-arm-length` sets the minimum length (in bp) for both the left and right arms of an IR pair. Short arms are more likely to be noise. The default is 10 bp.
+
+`--min-ir-identity` sets the minimum percent identity between the two arms. Identity is computed from the extracted arm sequences (left arm vs. reverse complement of right arm). The default is 70%.
+
+Both the unfiltered (`IRs_combined_remapped.tsv`) and filtered (`IRs_combined_filtered.tsv`) tables are written to the `04_inverted_repeats/` output directory, so you can always inspect what was removed.
+
+To disable filtering entirely, set both thresholds to zero:
+
+```bash
+shufflonfinder --input-fasta genomes/ --outdir results/ --min-ir-arm-length 0 --min-ir-identity 0
+```
 
 
 ## Project layout
@@ -195,7 +216,7 @@ shufflonfinder/
 │   ├── step_prokka.py           # Prokka wrapper
 │   ├── step_hmmsearch.py        # Multi-profile HMM search
 │   ├── step_flanking.py         # Flanking DNA extraction + deduplication
-│   ├── step_phava.py            # PHAVA wrapper + coordinate remapping
+│   ├── step_phava.py            # einverted IR detection + coordinate remapping
 │   ├── step_ir_cds.py           # IR-CDS containment annotation
 │   ├── step_gff.py              # GFF generation, merging, window extraction
 │   └── hmms/                    # Bundled HMM profiles (.hmm.gz)
