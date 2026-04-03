@@ -126,6 +126,12 @@ def parse_args(argv=None):
         help="Minimum IR arm length in bp to keep (default: 10).",
     )
     p.add_argument(
+        "--max-ir-arm-length", type=int, default=30,
+        help="Maximum IR arm length in bp to keep. Shufflon sfx recognition "
+             "sites are typically 19 bp; longer arms usually come from "
+             "transposon or IS-element IRs (default: 30).",
+    )
+    p.add_argument(
         "--min-ir-identity", type=float, default=70.0,
         help="Minimum percent identity between IR arms to keep (default: 70.0).",
     )
@@ -306,10 +312,11 @@ def main(argv=None):
     ir_df = combine_ir_tables(ir_results, ir_combined_path)
 
     # Apply IR quality filters (arm length / identity)
-    if args.min_ir_arm_length > 0 or args.min_ir_identity > 0:
+    if args.min_ir_arm_length > 0 or args.max_ir_arm_length > 0 or args.min_ir_identity > 0:
         ir_df = filter_ir_table(
             ir_df,
             min_arm_length=args.min_ir_arm_length,
+            max_arm_length=args.max_ir_arm_length,
             min_identity=args.min_ir_identity,
         )
         ir_filtered_path = os.path.join(dirs["ir"], "IRs_combined_filtered.tsv")
