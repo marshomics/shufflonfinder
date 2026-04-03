@@ -44,7 +44,12 @@ from .step_flanking import (
     extract_flanking_regions,
     flanking_regions_to_tsv,
 )
-from .step_phava import detect_inverted_repeats, combine_ir_tables, filter_ir_table
+from .step_phava import (
+    detect_inverted_repeats,
+    combine_ir_tables,
+    filter_ir_table,
+    filter_shufflon_candidates,
+)
 from .step_gff import (
     hmm_hits_to_gff,
     ir_to_gff,
@@ -123,6 +128,11 @@ def parse_args(argv=None):
     p.add_argument(
         "--min-ir-identity", type=float, default=70.0,
         help="Minimum percent identity between IR arms to keep (default: 70.0).",
+    )
+    p.add_argument(
+        "--min-ir-pairs", type=int, default=2,
+        help="Minimum number of IR pairs per cluster to qualify as a "
+             "shufflon candidate (default: 2).",
     )
     p.add_argument(
         "--skip-prokka", action="store_true",
@@ -279,17 +289,27 @@ def main(argv=None):
     ir_combined_path = os.path.join(dirs["ir"], "IRs_combined_remapped.tsv")
     ir_df = combine_ir_tables(ir_results, ir_combined_path)
 
-    # Apply IR quality filters
+    # Apply IR quality filters (arm length / identity)
     if args.min_ir_arm_length > 0 or args.min_ir_identity > 0:
         ir_df = filter_ir_table(
             ir_df,
             min_arm_length=args.min_ir_arm_length,
             min_identity=args.min_ir_identity,
         )
-        # Write filtered version alongside the unfiltered one
         ir_filtered_path = os.path.join(dirs["ir"], "IRs_combined_filtered.tsv")
         ir_df.to_csv(ir_filtered_path, sep="\t", index=False)
         logger.info("Filtered IR table: %d records -> %s", len(ir_df), ir_filtered_path)
+
+    # Apply shufflon candidate filter (density + CDS overlap)
+    ir_df = filter_shufflon_candidates(
+        ir_df,
+        samples,
+        window_size=args.window_size,
+        min_ir_pairs=args.min_ir_pairs,
+    )
+    ir_shufflon_path = os.path.join(dirs["ir"], "IRs_shufflon_candidates.tsv")
+    ir_df.to_csv(ir_shufflon_path, sep="\t", index=False)
+    logger.info("Shufflon candidate IRs: %d records -> %s", len(ir_df), ir_shufflon_path)
 
     # ==================================================================
     # Step 5: Generate and merge GFF files
