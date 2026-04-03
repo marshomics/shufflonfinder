@@ -192,10 +192,11 @@ def main(argv=None):
         "hmm_results":  ensure_dir(os.path.join(outdir, "02_hmmsearch", "results")),
         "flanking":     ensure_dir(os.path.join(outdir, "03_flanking")),
         "ir":           ensure_dir(os.path.join(outdir, "04_inverted_repeats")),
-        "gff_hmm":      ensure_dir(os.path.join(outdir, "05_gff", "hmm_hits")),
-        "gff_ir":       ensure_dir(os.path.join(outdir, "05_gff", "ir")),
-        "gff_merged":   ensure_dir(os.path.join(outdir, "05_gff", "merged")),
-        "windows":      ensure_dir(os.path.join(outdir, "06_shufflon_windows")),
+        "shufflon":     ensure_dir(os.path.join(outdir, "05_shufflon_filter")),
+        "gff_hmm":      ensure_dir(os.path.join(outdir, "06_gff", "hmm_hits")),
+        "gff_ir":       ensure_dir(os.path.join(outdir, "06_gff", "ir")),
+        "gff_merged":   ensure_dir(os.path.join(outdir, "06_gff", "merged")),
+        "windows":      ensure_dir(os.path.join(outdir, "07_shufflon_windows")),
     }
 
     # ==================================================================
@@ -300,22 +301,28 @@ def main(argv=None):
         ir_df.to_csv(ir_filtered_path, sep="\t", index=False)
         logger.info("Filtered IR table: %d records -> %s", len(ir_df), ir_filtered_path)
 
-    # Apply shufflon candidate filter (density + CDS overlap)
+    # ==================================================================
+    # Step 5: Shufflon candidate filtering (density + CDS overlap)
+    # ==================================================================
+    logger.info("=" * 60)
+    logger.info("STEP 5: Shufflon candidate filtering")
+    logger.info("=" * 60)
+
     ir_df = filter_shufflon_candidates(
         ir_df,
         samples,
         window_size=args.window_size,
         min_ir_pairs=args.min_ir_pairs,
     )
-    ir_shufflon_path = os.path.join(dirs["ir"], "IRs_shufflon_candidates.tsv")
+    ir_shufflon_path = os.path.join(dirs["shufflon"], "IRs_shufflon_candidates.tsv")
     ir_df.to_csv(ir_shufflon_path, sep="\t", index=False)
     logger.info("Shufflon candidate IRs: %d records -> %s", len(ir_df), ir_shufflon_path)
 
     # ==================================================================
-    # Step 5: Generate and merge GFF files
+    # Step 6: Generate and merge GFF files
     # ==================================================================
     logger.info("=" * 60)
-    logger.info("STEP 5: GFF generation and merging")
+    logger.info("STEP 6: GFF generation and merging")
     logger.info("=" * 60)
 
     # Generate HMM hit GFFs (per sample, with proper coordinates from GFF)
@@ -336,10 +343,10 @@ def main(argv=None):
         merge_gff_into_prokka(sample.gff_path, extra_gffs, merged_path)
 
     # ==================================================================
-    # Step 6: Extract shufflon windows
+    # Step 7: Extract shufflon windows
     # ==================================================================
     logger.info("=" * 60)
-    logger.info("STEP 6: Extracting shufflon windows")
+    logger.info("STEP 7: Extracting shufflon windows")
     logger.info("=" * 60)
 
     all_windows = []
