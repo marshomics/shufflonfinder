@@ -1,9 +1,10 @@
 """Step 4: Detect inverted repeats via EMBOSS einverted on flanking regions.
 
-Replaces the external PHAVA dependency with direct einverted calls.  Runs
-einverted at two sensitivity thresholds (51 and 75), merges the results
-with overlap deduplication, filters by minimum inter-arm distance, extracts
-arm sequences, and computes percent identity between arms.
+Runs einverted at two sensitivity thresholds (51 and 75), merges the
+results with coordinate-based deduplication (preserving distinct pairs in
+dense clusters), extracts arm sequences, computes percent identity, and
+applies shufflon-specific filters: minimum cluster density and at least
+one IR arm overlapping a CDS.
 """
 
 import logging
@@ -14,10 +15,13 @@ from dataclasses import dataclass, field
 import pandas as pd
 
 from .sample_sheet import Sample
-from .step_flanking import FlankingRegion, parse_fasta_file
+from .step_flanking import FlankingRegion, parse_fasta_file, parse_cds_from_gff
 from .utils import ensure_dir, run_cmd
 
 logger = logging.getLogger("shufflonfinder")
+
+# Tolerance (bp) for considering two IR pairs as the same detection
+_COORD_DEDUP_TOLERANCE = 3
 
 
 # ---------------------------------------------------------------------------
@@ -29,7 +33,7 @@ class InvertedRepeat:
     """One pair of inverted repeat arms detected by einverted."""
     chrom: str
     left_start: int   # 0-based
-    left_stop: int     # 1-based (exclusive-style, as PHAVA used it)
+    left_stop: int     # 1-based
     right_start: int   # 0-based
     right_stop: int    # 1-based
     left_seq: str = ""
@@ -113,7 +117,7 @@ def _parse_einverted_outfile(path: str) -> list[tuple[str, int, int, int, int]]:
         line 4: "<right_stop>  <seq>  <right_start>"
 
     Returns list of (chrom, left_start, left_stop, right_start, right_stop)
-    with 0-based start, 1-based stop (matching PHAVA's convention).
+    with 0-based start, 1-based stop.
     """
     if not os.path.isfile(path):
         return []
@@ -128,11 +132,9 @@ def _parse_einverted_outfile(path: str) -> list[tuple[str, int, int, int, int]]:
                 left_parts = lines[2].split()
                 right_parts = lines[4].split()
 
-                # left arm: first token is start, last token is stop
                 left_start = int(left_parts[0]) - 1   # to 0-based
                 left_stop = int(left_parts[-1])
 
-                # right arm: last token is start (smaller coord), first is stop
                 right_start = int(right_parts[-1]) - 1  # to 0-based
                 right_stop = int(right_parts[0])
 
@@ -142,35 +144,49 @@ def _parse_einverted_outfile(path: str) -> list[tuple[str, int, int, int, int]]:
     return irs
 
 
-def _coords_overlap(a: tuple, b: tuple) -> bool:
-    """Check if two IR coordinate tuples overlap on the same contig.
+def _is_coordinate_duplicate(
+    a: tuple[str, int, int, int, int],
+    b: tuple[str, int, int, int, int],
+    tolerance: int = _COORD_DEDUP_TOLERANCE,
+) -> bool:
+    """Check if two IR tuples represent the same detection.
 
-    Each tuple is (chrom, left_start, left_stop, right_start, right_stop).
-    Overlap is tested across the full span [left_start, right_stop].
+    Two IRs are duplicates if they're on the same contig and all four
+    coordinate values are within `tolerance` bp of each other.  This is
+    much more conservative than the old overlap-based check, which
+    incorrectly discarded distinct pairs in dense clusters.
     """
     if a[0] != b[0]:
         return False
-    a_min, a_max = a[1], a[4]
-    b_min, b_max = b[1], b[4]
-    return a_max >= b_min and b_max >= a_min
+    return (
+        abs(a[1] - b[1]) <= tolerance
+        and abs(a[2] - b[2]) <= tolerance
+        and abs(a[3] - b[3]) <= tolerance
+        and abs(a[4] - b[4]) <= tolerance
+    )
 
 
 def merge_einverted_results(
     outfile_51: str,
     outfile_75: str,
 ) -> list[tuple[str, int, int, int, int]]:
-    """Merge results from two einverted runs with overlap deduplication.
+    """Merge results from two einverted runs with coordinate-based dedup.
 
-    All threshold-75 results are kept.  Threshold-51 results are added only
-    if they don't overlap any threshold-75 result on the same contig.
+    Pools all IRs from both threshold runs.  When two IRs from different
+    runs have nearly identical coordinates (both arms within 3 bp), the
+    duplicate is removed.  Unlike the old overlap-based merge, this
+    preserves distinct IR pairs that happen to share a dense genomic
+    region (exactly the pattern seen in shufflons).
     """
     irs_75 = _parse_einverted_outfile(outfile_75)
     irs_51 = _parse_einverted_outfile(outfile_51)
 
+    # Start with all threshold-75 results
     merged = list(irs_75)
 
+    # Add threshold-51 results that aren't coordinate-duplicates of a t75 hit
     for ir51 in irs_51:
-        if not any(_coords_overlap(ir51, ir75) for ir75 in irs_75):
+        if not any(_is_coordinate_duplicate(ir51, existing) for existing in merged):
             merged.append(ir51)
 
     return merged
@@ -181,12 +197,10 @@ def merge_einverted_results(
 # ---------------------------------------------------------------------------
 
 def _compute_percent_identity(seq_a: str, seq_b: str) -> float:
-    """Compute percent identity between two sequences of equal length.
+    """Compute percent identity between two IR arm sequences.
 
-    For IR arms the sequences are complementary-reversed, so we compare
-    seq_a to the reverse complement of seq_b.  If the lengths differ
-    (shouldn't happen with einverted output, but just in case), we
-    compare up to the shorter length.
+    Compares seq_a to the reverse complement of seq_b (since IR arms are
+    complementary-reversed).
     """
     complement = str.maketrans("ACGTacgtNn", "TGCAtgcaNn")
     rev_comp_b = seq_b[::-1].translate(complement)
@@ -209,8 +223,7 @@ def annotate_ir_sequences(
 ) -> list[InvertedRepeat]:
     """Extract arm/middle sequences for each IR and compute percent identity.
 
-    Also applies the minimum inter-arm distance filter (default 30 bp,
-    matching PHAVA's hardcoded filter).
+    Also applies the minimum inter-arm distance filter (default 30 bp).
 
     Args:
         raw_irs: Coordinate tuples from merged einverted output.
@@ -231,7 +244,6 @@ def annotate_ir_sequences(
         right_seq = seq[rs:re_]
         middle_seq = seq[le:rs]
 
-        # Minimum inter-arm distance filter
         if len(middle_seq) < min_middle_bp:
             continue
 
@@ -253,8 +265,7 @@ def annotate_ir_sequences(
 
 
 def irs_to_dataframe(irs: list[InvertedRepeat]) -> pd.DataFrame:
-    """Convert InvertedRepeat objects to a DataFrame matching the old IRs.tsv
-    format, plus a PercentIdentity column."""
+    """Convert InvertedRepeat objects to a DataFrame."""
     rows = []
     for ir in irs:
         rows.append({
@@ -272,7 +283,7 @@ def irs_to_dataframe(irs: list[InvertedRepeat]) -> pd.DataFrame:
 
 
 def export_irs_tsv(ir_df: pd.DataFrame, out_dir: str) -> str:
-    """Write IRs.tsv to the data/ subdirectory (same layout PHAVA produced)."""
+    """Write IRs.tsv to the data/ subdirectory."""
     data_dir = ensure_dir(os.path.join(out_dir, "data"))
     path = os.path.join(data_dir, "IRs.tsv")
     ir_df.to_csv(path, sep="\t", index=False)
@@ -281,7 +292,7 @@ def export_irs_tsv(ir_df: pd.DataFrame, out_dir: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Top-level entry point (replaces run_phava_on_flanking)
+# Top-level detection entry point
 # ---------------------------------------------------------------------------
 
 def detect_inverted_repeats(
@@ -292,9 +303,9 @@ def detect_inverted_repeats(
 ) -> str:
     """Detect inverted repeats in flanking DNA via einverted.
 
-    Replaces the old run_phava_on_flanking(). Runs einverted at two
-    thresholds, merges with deduplication, extracts sequences, computes
-    percent identity, and writes IRs.tsv.
+    Runs einverted at two thresholds, merges with coordinate-based
+    deduplication, extracts sequences, computes percent identity, and
+    writes IRs.tsv.
 
     Args:
         sample: The Sample being processed.
@@ -316,27 +327,21 @@ def detect_inverted_repeats(
 
     sample_dir = ensure_dir(os.path.join(outdir, sample.sample_id))
 
-    # Run einverted at two thresholds
     outfile_51, outfile_75 = run_einverted_dual(flanking_fasta, sample_dir, cpus=cpus)
 
-    # Merge with overlap deduplication
     raw_irs = merge_einverted_results(outfile_51, outfile_75)
     logger.info(
-        "einverted found %d IRs for %s (after overlap dedup)",
+        "einverted found %d IRs for %s (after coordinate dedup)",
         len(raw_irs), sample.sample_id,
     )
 
-    # Load flanking sequences for arm extraction
     sequences = parse_fasta_file(flanking_fasta)
-
-    # Annotate sequences and compute identity
     annotated = annotate_ir_sequences(raw_irs, sequences)
     logger.info(
         "%d IRs passed min-middle-distance filter for %s",
         len(annotated), sample.sample_id,
     )
 
-    # Export
     ir_df = irs_to_dataframe(annotated)
     export_irs_tsv(ir_df, sample_dir)
 
@@ -345,18 +350,11 @@ def detect_inverted_repeats(
 
 
 # ---------------------------------------------------------------------------
-# Loading, remapping, filtering, combining (unchanged interface)
+# Loading, remapping, combining
 # ---------------------------------------------------------------------------
 
 def load_ir_table(ir_dir: str) -> pd.DataFrame:
-    """Load the inverted repeats table from an output directory.
-
-    Looks for data/IRs.tsv within the directory.
-
-    Returns:
-        DataFrame with columns: IR_Chr, LeftIRStart, LeftIRStop,
-        RightIRStart, RightIRStop, PercentIdentity, etc.
-    """
+    """Load the inverted repeats table from an output directory."""
     if not ir_dir:
         return pd.DataFrame()
 
@@ -378,19 +376,7 @@ def remap_ir_to_genome_coords(
     ir_df: pd.DataFrame,
     flanking_regions: list[FlankingRegion],
 ) -> pd.DataFrame:
-    """Convert IR coordinates from flanking-region-local to genome-absolute.
-
-    einverted reports IR positions relative to the flanking FASTA records.
-    This function maps them back to the original contig coordinate space.
-
-    Args:
-        ir_df: IR table (coordinates relative to flanking records).
-        flanking_regions: The FlankingRegion objects used to build the FASTA.
-
-    Returns:
-        IR DataFrame with coordinates translated to genome-absolute positions,
-        plus additional columns: sample_id, hmm_profiles, locus_tag, contig.
-    """
+    """Convert IR coordinates from flanking-region-local to genome-absolute."""
     if ir_df.empty:
         return ir_df
 
@@ -399,14 +385,12 @@ def remap_ir_to_genome_coords(
     rows = []
     for _, ir_row in ir_df.iterrows():
         ir_chr = str(ir_row["IR_Chr"])
-
         region = region_map.get(ir_chr)
         if region is None:
             logger.debug("IR_Chr '%s' doesn't match any flanking region, skipping", ir_chr)
             continue
 
-        # Offset: flanking region starts at flank_start (1-based)
-        offset = region.flank_start - 1  # convert to 0-based for arithmetic
+        offset = region.flank_start - 1
 
         remapped = ir_row.copy()
         remapped["IR_Chr"] = region.contig
@@ -436,27 +420,12 @@ def filter_ir_table(
     min_arm_length: int = 0,
     min_identity: float = 0.0,
 ) -> pd.DataFrame:
-    """Filter inverted repeats by arm length and percent identity.
-
-    Arm length is computed from the coordinate columns.
-    Percent identity uses the PercentIdentity column (computed from arm
-    sequences during detection).  Falls back to searching for legacy column
-    names if PercentIdentity isn't present.
-
-    Args:
-        ir_df: IR DataFrame (pre- or post-remapping).
-        min_arm_length: Minimum arm length in bp.  0 disables the filter.
-        min_identity: Minimum percent identity (0-100).  0 disables the filter.
-
-    Returns:
-        Filtered DataFrame.
-    """
+    """Filter inverted repeats by arm length and percent identity."""
     if ir_df.empty:
         return ir_df
 
     before = len(ir_df)
 
-    # ---- arm length filter ----
     if min_arm_length > 0:
         left_len = (ir_df["LeftIRStop"] - ir_df["LeftIRStart"]).abs() + 1
         right_len = (ir_df["RightIRStop"] - ir_df["RightIRStart"]).abs() + 1
@@ -467,7 +436,6 @@ def filter_ir_table(
             min_arm_length, before, len(ir_df),
         )
 
-    # ---- percent identity filter ----
     if min_identity > 0 and not ir_df.empty:
         identity_col = None
         for candidate in ("PercentIdentity", "Percent", "Match", "Score", "Identity"):
@@ -500,15 +468,7 @@ def combine_ir_tables(
     ir_results: list[tuple[str, str, list[FlankingRegion]]],
     output_path: str,
 ) -> pd.DataFrame:
-    """Combine and remap IR tables from multiple einverted runs.
-
-    Args:
-        ir_results: List of (ir_dir, sample_id, flanking_regions) tuples.
-        output_path: Where to write the combined TSV.
-
-    Returns:
-        Combined DataFrame with genome-absolute coordinates.
-    """
+    """Combine and remap IR tables from multiple einverted runs."""
     frames = []
     for ir_dir, sid, flanking_regions in ir_results:
         raw_ir = load_ir_table(ir_dir)
@@ -527,3 +487,166 @@ def combine_ir_tables(
     combined.to_csv(output_path, sep="\t", index=False)
     logger.info("Combined IR table: %d records -> %s", len(combined), output_path)
     return combined
+
+
+# ---------------------------------------------------------------------------
+# Shufflon candidate filtering: density + CDS overlap
+# ---------------------------------------------------------------------------
+
+def _ir_span(row: pd.Series) -> tuple[int, int]:
+    """Return the full span (min_coord, max_coord) of an IR pair."""
+    coords = [row["LeftIRStart"], row["LeftIRStop"],
+              row["RightIRStart"], row["RightIRStop"]]
+    return int(min(coords)), int(max(coords))
+
+
+def _cluster_ir_rows(
+    ir_df: pd.DataFrame,
+    window_size: int,
+) -> list[list[int]]:
+    """Cluster IR rows by proximity on the same contig.
+
+    Returns a list of clusters, where each cluster is a list of row indices.
+    Two IR pairs are in the same cluster if any of their arms is within
+    window_size bp of any arm in the cluster.
+    """
+    if ir_df.empty:
+        return []
+
+    # Sort by contig then by leftmost coordinate
+    ir_df = ir_df.copy()
+    ir_df["_span_min"] = ir_df.apply(lambda r: _ir_span(r)[0], axis=1)
+    sorted_idx = ir_df.sort_values(["IR_Chr", "_span_min"]).index.tolist()
+
+    clusters = []
+    current_cluster = [sorted_idx[0]]
+    current_contig = ir_df.loc[sorted_idx[0], "IR_Chr"]
+    current_max = _ir_span(ir_df.loc[sorted_idx[0]])[1]
+
+    for idx in sorted_idx[1:]:
+        row = ir_df.loc[idx]
+        span_min, span_max = _ir_span(row)
+        contig = row["IR_Chr"]
+
+        if contig == current_contig and span_min <= current_max + window_size:
+            current_cluster.append(idx)
+            current_max = max(current_max, span_max)
+        else:
+            clusters.append(current_cluster)
+            current_cluster = [idx]
+            current_contig = contig
+            current_max = span_max
+
+    clusters.append(current_cluster)
+    return clusters
+
+
+def _arm_overlaps_cds(
+    arm_start: int,
+    arm_stop: int,
+    cds_list: list,
+) -> bool:
+    """Check if an IR arm overlaps any CDS feature.
+
+    Uses 0-based coordinates throughout.  An arm overlaps a CDS if
+    [arm_start, arm_stop) intersects [cds.start-1, cds.end).
+    """
+    for cds in cds_list:
+        cds_s = cds.start - 1  # CdsCoords are 1-based
+        cds_e = cds.end
+        if arm_stop > cds_s and arm_start < cds_e:
+            return True
+    return False
+
+
+def filter_shufflon_candidates(
+    ir_df: pd.DataFrame,
+    samples: list[Sample],
+    window_size: int = 3000,
+    min_ir_pairs: int = 2,
+) -> pd.DataFrame:
+    """Filter IRs to keep only dense, shufflon-like clusters.
+
+    A valid shufflon candidate must have:
+      1. At least `min_ir_pairs` IR pairs within a `window_size` bp cluster.
+      2. At least one IR arm in the cluster overlapping a CDS.
+
+    IRs that don't belong to any qualifying cluster are removed.
+
+    Args:
+        ir_df: Remapped IR DataFrame (genome-absolute coordinates).
+        samples: List of all Sample objects (for GFF CDS lookup).
+        window_size: Maximum gap (bp) for clustering nearby IR pairs.
+        min_ir_pairs: Minimum number of IR pairs per cluster.
+
+    Returns:
+        Filtered DataFrame containing only IRs from qualifying clusters,
+        plus a new ``cluster_id`` column.
+    """
+    if ir_df.empty:
+        return ir_df
+
+    # Build a CDS lookup per (sample, contig)
+    sample_map = {s.sample_id: s for s in samples}
+    cds_cache: dict[str, dict[str, list]] = {}  # sample_id -> contig -> [CdsCoords]
+
+    def _get_cds(sample_id: str, contig: str) -> list:
+        if sample_id not in cds_cache:
+            sample = sample_map.get(sample_id)
+            if sample and sample.gff_path:
+                by_contig: dict[str, list] = {}
+                for cds in parse_cds_from_gff(sample.gff_path).values():
+                    by_contig.setdefault(cds.contig, []).append(cds)
+                cds_cache[sample_id] = by_contig
+            else:
+                cds_cache[sample_id] = {}
+        return cds_cache[sample_id].get(contig, [])
+
+    before = len(ir_df)
+    keep_indices = []
+    cluster_labels = {}
+
+    # Process each sample independently
+    for sample_id, sample_irs in ir_df.groupby("sample_id"):
+        clusters = _cluster_ir_rows(sample_irs, window_size)
+
+        for ci, cluster_idx in enumerate(clusters):
+            # Density check
+            if len(cluster_idx) < min_ir_pairs:
+                continue
+
+            # CDS overlap check: at least one arm in the cluster must
+            # overlap a CDS on the same contig
+            has_cds_overlap = False
+            for idx in cluster_idx:
+                row = ir_df.loc[idx]
+                contig = str(row["IR_Chr"])
+                cds_list = _get_cds(sample_id, contig)
+                if (_arm_overlaps_cds(int(row["LeftIRStart"]), int(row["LeftIRStop"]), cds_list)
+                        or _arm_overlaps_cds(int(row["RightIRStart"]), int(row["RightIRStop"]), cds_list)):
+                    has_cds_overlap = True
+                    break
+
+            if not has_cds_overlap:
+                continue
+
+            cid = f"{sample_id}_cluster_{ci + 1}"
+            for idx in cluster_idx:
+                keep_indices.append(idx)
+                cluster_labels[idx] = cid
+
+    if not keep_indices:
+        logger.warning("No IR clusters met the shufflon candidate criteria")
+        return pd.DataFrame(columns=list(ir_df.columns) + ["cluster_id"])
+
+    result = ir_df.loc[keep_indices].copy()
+    result["cluster_id"] = [cluster_labels[i] for i in keep_indices]
+
+    removed = before - len(result)
+    n_clusters = result["cluster_id"].nunique()
+    logger.info(
+        "Shufflon candidate filter: %d -> %d IRs in %d cluster(s) "
+        "(removed %d IRs from sparse or non-coding regions)",
+        before, len(result), n_clusters, removed,
+    )
+    return result
