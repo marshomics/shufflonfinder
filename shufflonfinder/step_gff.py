@@ -389,6 +389,104 @@ def find_intersecting_cds(ir_group, cds_features):
     return [cds for cds in cds_features if window.overlaps(cds)]
 
 
+def _find_invertible_segments(ir_group: list[Feature]) -> list[tuple[int, int]]:
+    """Identify invertible DNA segments between consecutive IR arms.
+
+    In a shufflon, the recognition sites (IR arms) flank invertible gene
+    cassettes.  This function finds the segments between the right arm of
+    one IR pair and the left arm of the next (sorted by position), which
+    correspond to the invertible cassettes.
+
+    Returns a list of (start, end) tuples in the same coordinate space as
+    the input features (0-based start, 1-based end).
+    """
+    # Collect all individual arm positions
+    arms = []
+    for ir in ir_group:
+        arms.append((ir.start, ir.end))
+    arms.sort()
+
+    # Segments are the gaps between consecutive arms
+    segments = []
+    for i in range(len(arms) - 1):
+        gap_start = arms[i][1]      # end of current arm
+        gap_end = arms[i + 1][0]    # start of next arm
+        if gap_end > gap_start + 30:  # minimum 30bp to be a real segment
+            segments.append((gap_start, gap_end))
+
+    return segments
+
+
+def _find_orfs_in_segment(
+    seq: str,
+    seg_start: int,
+    seg_end: int,
+    min_aa: int = 30,
+) -> list[tuple[int, int, str]]:
+    """Find open reading frames within a DNA segment.
+
+    Searches all 6 reading frames for the longest ORF in the segment.
+    Returns list of (start, end, strand) tuples in genome coordinates.
+    """
+    segment_seq = seq[seg_start:seg_end]
+    if len(segment_seq) < min_aa * 3:
+        return []
+
+    complement = str.maketrans("ACGTacgtNn", "TGCAtgcaNn")
+
+    orfs = []
+    for strand, search_seq in [("+", segment_seq),
+                                ("-", segment_seq[::-1].translate(complement))]:
+        for frame in range(3):
+            i = frame
+            while i + 2 < len(search_seq):
+                codon = search_seq[i:i + 3].upper()
+                if codon in ("ATG", "GTG", "TTG"):
+                    # Found start, search for stop
+                    for j in range(i + 3, len(search_seq) - 2, 3):
+                        stop = search_seq[j:j + 3].upper()
+                        if stop in ("TAA", "TAG", "TGA"):
+                            orf_len_aa = (j - i) // 3
+                            if orf_len_aa >= min_aa:
+                                if strand == "+":
+                                    orfs.append((
+                                        seg_start + i,
+                                        seg_start + j + 3,
+                                        strand,
+                                    ))
+                                else:
+                                    rc_start = len(search_seq) - (j + 3)
+                                    rc_end = len(search_seq) - i
+                                    orfs.append((
+                                        seg_start + rc_start,
+                                        seg_start + rc_end,
+                                        strand,
+                                    ))
+                            i = j + 3
+                            break
+                    else:
+                        # No stop found; check if remaining ORF is long enough
+                        remaining_aa = (len(search_seq) - i) // 3
+                        if remaining_aa >= min_aa:
+                            if strand == "+":
+                                orfs.append((
+                                    seg_start + i,
+                                    seg_start + len(search_seq),
+                                    strand,
+                                ))
+                            else:
+                                orfs.append((
+                                    seg_start,
+                                    seg_start + len(search_seq) - i,
+                                    strand,
+                                ))
+                        break
+                else:
+                    i += 3
+
+    return orfs
+
+
 def _find_nearby_hmm_hits(
     ir_group: list[Feature],
     hmm_features: list[Feature],
@@ -493,6 +591,13 @@ def extract_shufflon_windows(
                 f"{input_prefix}_contig_{contig_id}_window_{wnum}.gff",
             )
 
+            # Find invertible segments between IR arms and ORFs within them
+            inv_segments = _find_invertible_segments(ir_group)
+            segment_orfs = []
+            for seg_s, seg_e in inv_segments:
+                orfs = _find_orfs_in_segment(seq, seg_s, seg_e, min_aa=30)
+                segment_orfs.extend(orfs)
+
             with open(out_path, "w") as fh:
                 fh.write("##gff-version 3\n")
 
@@ -512,12 +617,53 @@ def extract_shufflon_windows(
                         f"{hmm.strand}\t.\t{hmm.attributes}\n"
                     )
 
-                # Track 3: CDS features
+                # Track 3: CDS features (from Prokka)
                 for cds in intersecting_cds:
                     fh.write(
                         f"{seq_id}\t{cds.source}\tCDS\t"
                         f"{cds.start - win_start + 1}\t{cds.end - win_start}\t.\t"
                         f"{cds.strand}\t.\t{cds.attributes}\n"
+                    )
+
+                # Track 4: invertible segments (DNA between IR arms)
+                for si, (seg_s, seg_e) in enumerate(inv_segments, start=1):
+                    local_s = seg_s - win_start + 1
+                    local_e = seg_e - win_start
+                    seg_len = seg_e - seg_s
+                    fh.write(
+                        f"{seq_id}\tshufflonfinder\tinvertible_segment\t"
+                        f"{local_s}\t{local_e}\t.\t.\t.\t"
+                        f"ID=invertible_segment_{si:03d};"
+                        f"Name=Invertible segment {si} ({seg_len} bp)\n"
+                    )
+
+                # Track 5: predicted ORFs within invertible segments
+                # (only those not already covered by Prokka CDS)
+                prokka_spans = set()
+                for cds in intersecting_cds:
+                    prokka_spans.add((cds.start, cds.end))
+
+                orf_counter = 0
+                for orf_s, orf_e, orf_strand in segment_orfs:
+                    # Skip if a Prokka CDS already covers this region
+                    covered = any(
+                        cs <= orf_s and ce >= orf_e
+                        for cs, ce in prokka_spans
+                    )
+                    if covered:
+                        continue
+                    orf_counter += 1
+                    local_s = orf_s - win_start + 1
+                    local_e = orf_e - win_start
+                    orf_len_aa = (orf_e - orf_s) // 3
+                    fh.write(
+                        f"{seq_id}\tshufflonfinder\tCDS\t"
+                        f"{local_s}\t{local_e}\t.\t{orf_strand}\t0\t"
+                        f"ID=shufflon_orf_{orf_counter:03d};"
+                        f"Name=Predicted shufflon cassette ORF "
+                        f"({orf_len_aa} aa);"
+                        f"product=putative shufflon cassette protein;"
+                        f"inference=ab initio prediction:shufflonfinder\n"
                     )
 
                 fh.write("##FASTA\n")
