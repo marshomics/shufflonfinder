@@ -6,9 +6,9 @@ dependencies:
   - python>=3.9
   - prokka>=1.14
   - hmmer>=3.3
+  - emboss>=6.6
   - biopython>=1.80
   - pandas>=1.5
   - pip
   - pip:
-    - phava
     - -e .
