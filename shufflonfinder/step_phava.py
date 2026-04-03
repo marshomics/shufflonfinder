@@ -559,25 +559,49 @@ def _arm_overlaps_cds(
     return False
 
 
+def _cluster_density(ir_df: pd.DataFrame, cluster_idx: list[int]) -> float:
+    """Compute IR pair density (pairs per kilobase) for a cluster."""
+    if len(cluster_idx) < 2:
+        return float("inf")  # single-pair clusters are infinitely dense
+
+    spans = [_ir_span(ir_df.loc[idx]) for idx in cluster_idx]
+    cluster_start = min(s[0] for s in spans)
+    cluster_end = max(s[1] for s in spans)
+    span_kb = max((cluster_end - cluster_start) / 1000.0, 0.001)
+    return len(cluster_idx) / span_kb
+
+
 def filter_shufflon_candidates(
     ir_df: pd.DataFrame,
     samples: list[Sample],
+    cluster_distance: int = 1000,
+    min_ir_pairs: int = 3,
+    min_ir_density: float = 2.0,
     window_size: int = 3000,
-    min_ir_pairs: int = 2,
 ) -> pd.DataFrame:
     """Filter IRs to keep only dense, shufflon-like clusters.
 
     A valid shufflon candidate must have:
-      1. At least `min_ir_pairs` IR pairs within a `window_size` bp cluster.
-      2. At least one IR arm in the cluster overlapping a CDS.
+      1. At least ``min_ir_pairs`` IR pairs within a cluster (clustered at
+         ``cluster_distance`` bp gaps).
+      2. A density of at least ``min_ir_density`` IR pairs per kilobase.
+      3. At least one IR arm in the cluster overlapping a CDS.
 
-    IRs that don't belong to any qualifying cluster are removed.
+    Shufflons pack multiple recognition sites into a few kilobases, so the
+    density requirement is critical for distinguishing them from regions
+    where transposon or IS-element IRs happen to accumulate near a
+    recombinase gene.
 
     Args:
         ir_df: Remapped IR DataFrame (genome-absolute coordinates).
         samples: List of all Sample objects (for GFF CDS lookup).
-        window_size: Maximum gap (bp) for clustering nearby IR pairs.
+        cluster_distance: Maximum gap (bp) between IR pairs for chaining
+            into one cluster.  Default 1000 (tighter than the window
+            extraction distance, to isolate the dense shufflon core).
         min_ir_pairs: Minimum number of IR pairs per cluster.
+        min_ir_density: Minimum IR pairs per kilobase of cluster span.
+        window_size: Passed through for compatibility but NOT used for
+            clustering; use ``cluster_distance`` instead.
 
     Returns:
         Filtered DataFrame containing only IRs from qualifying clusters,
@@ -588,7 +612,7 @@ def filter_shufflon_candidates(
 
     # Build a CDS lookup per (sample, contig)
     sample_map = {s.sample_id: s for s in samples}
-    cds_cache: dict[str, dict[str, list]] = {}  # sample_id -> contig -> [CdsCoords]
+    cds_cache: dict[str, dict[str, list]] = {}
 
     def _get_cds(sample_id: str, contig: str) -> list:
         if sample_id not in cds_cache:
@@ -606,17 +630,27 @@ def filter_shufflon_candidates(
     keep_indices = []
     cluster_labels = {}
 
-    # Process each sample independently
     for sample_id, sample_irs in ir_df.groupby("sample_id"):
-        clusters = _cluster_ir_rows(sample_irs, window_size)
+        clusters = _cluster_ir_rows(sample_irs, cluster_distance)
 
         for ci, cluster_idx in enumerate(clusters):
-            # Density check
+            # --- count check ---
             if len(cluster_idx) < min_ir_pairs:
                 continue
 
-            # CDS overlap check: at least one arm in the cluster must
-            # overlap a CDS on the same contig
+            # --- density check ---
+            density = _cluster_density(ir_df, cluster_idx)
+            if density < min_ir_density:
+                spans = [_ir_span(ir_df.loc[idx]) for idx in cluster_idx]
+                span_bp = max(s[1] for s in spans) - min(s[0] for s in spans)
+                logger.debug(
+                    "Cluster with %d pairs over %d bp (%.2f pairs/kb) "
+                    "rejected by density filter (min %.2f)",
+                    len(cluster_idx), span_bp, density, min_ir_density,
+                )
+                continue
+
+            # --- CDS overlap check ---
             has_cds_overlap = False
             for idx in cluster_idx:
                 row = ir_df.loc[idx]
