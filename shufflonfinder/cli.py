@@ -130,9 +130,24 @@ def parse_args(argv=None):
         help="Minimum percent identity between IR arms to keep (default: 70.0).",
     )
     p.add_argument(
-        "--min-ir-pairs", type=int, default=2,
+        "--min-ir-pairs", type=int, default=3,
         help="Minimum number of IR pairs per cluster to qualify as a "
-             "shufflon candidate (default: 2).",
+             "shufflon candidate (default: 3).",
+    )
+    p.add_argument(
+        "--cluster-distance", type=int, default=1000,
+        help="Maximum gap (bp) between adjacent IR pairs for chaining "
+             "into one cluster during shufflon candidate filtering. "
+             "Tighter than --window-size to isolate the dense shufflon "
+             "core from neighboring transposon or IS-element repeats "
+             "(default: 1000).",
+    )
+    p.add_argument(
+        "--min-ir-density", type=float, default=2.0,
+        help="Minimum IR pairs per kilobase within a cluster to qualify "
+             "as a shufflon candidate. Shufflons pack multiple "
+             "recognition sites into a few kilobases; sparse repeat "
+             "regions are filtered out (default: 2.0).",
     )
     p.add_argument(
         "--skip-prokka", action="store_true",
@@ -311,8 +326,10 @@ def main(argv=None):
     ir_df = filter_shufflon_candidates(
         ir_df,
         samples,
-        window_size=args.window_size,
+        cluster_distance=args.cluster_distance,
         min_ir_pairs=args.min_ir_pairs,
+        min_ir_density=args.min_ir_density,
+        window_size=args.window_size,
     )
     ir_shufflon_path = os.path.join(dirs["shufflon"], "IRs_shufflon_candidates.tsv")
     ir_df.to_csv(ir_shufflon_path, sep="\t", index=False)
