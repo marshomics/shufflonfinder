@@ -4,6 +4,7 @@ import csv
 import logging
 import os
 from collections import defaultdict
+from dataclasses import dataclass, field
 from io import StringIO
 
 import pandas as pd
@@ -208,6 +209,22 @@ def merge_gff_into_prokka(
 # Window-based GFF filtering (IR + CDS co-location)
 # ---------------------------------------------------------------------------
 
+def _parse_gff_attributes(attr_string: str) -> dict[str, str]:
+    """Parse a GFF3 attributes column into a dict.
+
+    Handles semicolon-separated key=value pairs.  Returns a dict with
+    lowercased keys for case-insensitive lookup.
+    """
+    attrs = {}
+    for part in attr_string.split(";"):
+        part = part.strip()
+        if "=" in part:
+            key, _, val = part.partition("=")
+            attrs[key] = val
+            attrs[key.lower()] = val   # also store lowercase for easy lookup
+    return attrs
+
+
 class Feature:
     """Lightweight representation of a GFF feature for spatial operations."""
 
@@ -231,6 +248,39 @@ class Feature:
         if self.overlaps(other):
             return 0
         return min(abs(self.start - other.end), abs(self.end - other.start))
+
+    @property
+    def parsed_attributes(self) -> dict[str, str]:
+        return _parse_gff_attributes(self.attributes)
+
+    @property
+    def locus_tag(self) -> str:
+        attrs = self.parsed_attributes
+        return attrs.get("ID", attrs.get("locus_tag", ""))
+
+    @property
+    def product(self) -> str:
+        attrs = self.parsed_attributes
+        return attrs.get("product", attrs.get("Product", ""))
+
+    @property
+    def name(self) -> str:
+        attrs = self.parsed_attributes
+        return attrs.get("Name", attrs.get("name", ""))
+
+
+@dataclass
+class ShufflonWindow:
+    """Structured representation of one extracted shufflon window."""
+    sample_id: str
+    window_id: str
+    contig: str
+    window_start: int   # 0-based
+    window_end: int     # 1-based
+    n_ir_pairs: int
+    ir_features: list[Feature] = field(default_factory=list)
+    cds_features: list[Feature] = field(default_factory=list)
+    gff_path: str = ""
 
 
 def parse_gff_with_fasta(gff_path: str):
@@ -324,8 +374,9 @@ def find_intersecting_cds(ir_group, cds_features):
 def extract_shufflon_windows(
     merged_gff: str,
     output_dir: str,
+    sample_id: str = "",
     window_size: int = 3000,
-) -> list[str]:
+) -> list[ShufflonWindow]:
     """Extract GFF+FASTA windows where inverted repeats co-locate with CDS features.
 
     This is the final filtering step: for each cluster of nearby IRs, find
@@ -333,12 +384,13 @@ def extract_shufflon_windows(
     sequence.
 
     Args:
-        merged_gff: Path to a merged GFF (Prokka + pilV + IR annotations, with FASTA).
+        merged_gff: Path to a merged GFF (Prokka + HMM + IR annotations, with FASTA).
         output_dir: Where to write the per-window GFF files.
+        sample_id: Sample identifier (used in the returned ShufflonWindow objects).
         window_size: Maximum distance (bp) to cluster IRs together.
 
     Returns:
-        List of paths to the output window GFF files.
+        List of ShufflonWindow objects (one per extracted window).
     """
     ensure_dir(output_dir)
     input_prefix = os.path.splitext(os.path.basename(merged_gff))[0]
@@ -349,7 +401,7 @@ def extract_shufflon_windows(
         logger.warning("No FASTA sequences found in %s", merged_gff)
         return []
 
-    output_files = []
+    windows = []
     window_counter = defaultdict(int)
 
     for contig_id, ir_features in ir_by_contig.items():
@@ -378,6 +430,7 @@ def extract_shufflon_windows(
                 continue
 
             seq_id = f"{input_prefix}_{contig_id}_{wnum}"
+            window_id = f"{sample_id}_{contig_id}_w{wnum}" if sample_id else seq_id
             out_path = os.path.join(
                 output_dir,
                 f"{input_prefix}_contig_{contig_id}_window_{wnum}.gff",
@@ -400,9 +453,120 @@ def extract_shufflon_windows(
                 fh.write("##FASTA\n")
                 fh.write(f">{seq_id}\n{seq[win_start:win_end]}\n")
 
-            output_files.append(out_path)
+            # IR features come in pairs (F/R), so count pairs
+            n_ir_pairs = len(ir_group) // 2
+
+            win = ShufflonWindow(
+                sample_id=sample_id,
+                window_id=window_id,
+                contig=contig_id,
+                window_start=win_start,
+                window_end=win_end,
+                n_ir_pairs=n_ir_pairs,
+                ir_features=list(ir_group),
+                cds_features=list(intersecting),
+                gff_path=out_path,
+            )
+            windows.append(win)
 
     logger.info(
-        "Extracted %d shufflon windows from %s", len(output_files), merged_gff
+        "Extracted %d shufflon windows from %s", len(windows), merged_gff
     )
-    return output_files
+    return windows
+
+
+def shufflon_windows_to_tsv(
+    windows: list[ShufflonWindow],
+    output_path: str,
+) -> pd.DataFrame:
+    """Write a summary table of all shufflon windows with IR and CDS details.
+
+    Each row represents one CDS feature within a window. IR information for
+    the window is repeated on every row.
+
+    Columns:
+        sample_id, window_id, contig, window_start, window_end,
+        n_ir_pairs, ir_coords, locus_tag, cds_start, cds_end, strand,
+        product, cds_source, gff_path
+
+    Args:
+        windows: List of ShufflonWindow objects.
+        output_path: Where to write the TSV.
+
+    Returns:
+        The summary DataFrame.
+    """
+    rows = []
+    for win in windows:
+        # Build a compact string summarising all IR pair coordinates in this window
+        # Group IR features into pairs by their ID prefix (strip _F/_R suffix)
+        ir_pairs = defaultdict(dict)
+        for ir in win.ir_features:
+            attrs = _parse_gff_attributes(ir.attributes)
+            ir_id = attrs.get("ID", "")
+            if ir_id.endswith("_F"):
+                ir_pairs[ir_id[:-2]]["F"] = ir
+            elif ir_id.endswith("_R"):
+                ir_pairs[ir_id[:-2]]["R"] = ir
+            else:
+                ir_pairs[ir_id]["?"] = ir
+
+        ir_coord_parts = []
+        for pair_id, sides in ir_pairs.items():
+            f = sides.get("F")
+            r = sides.get("R")
+            if f and r:
+                ir_coord_parts.append(
+                    f"{f.start + 1}-{f.end}..{r.start + 1}-{r.end}"
+                )
+            elif f:
+                ir_coord_parts.append(f"{f.start + 1}-{f.end}")
+            elif r:
+                ir_coord_parts.append(f"{r.start + 1}-{r.end}")
+        ir_coords_str = "; ".join(ir_coord_parts) if ir_coord_parts else ""
+
+        if not win.cds_features:
+            # Window with no CDS (shouldn't happen given the filtering, but
+            # include a row for completeness)
+            rows.append({
+                "sample_id": win.sample_id,
+                "window_id": win.window_id,
+                "contig": win.contig,
+                "window_start": win.window_start + 1,  # 1-based for output
+                "window_end": win.window_end,
+                "window_length_bp": win.window_end - win.window_start,
+                "n_ir_pairs": win.n_ir_pairs,
+                "ir_coords": ir_coords_str,
+                "locus_tag": "",
+                "cds_start": "",
+                "cds_end": "",
+                "strand": "",
+                "product": "",
+                "cds_source": "",
+                "gff_path": win.gff_path,
+            })
+        else:
+            for cds in win.cds_features:
+                rows.append({
+                    "sample_id": win.sample_id,
+                    "window_id": win.window_id,
+                    "contig": win.contig,
+                    "window_start": win.window_start + 1,
+                    "window_end": win.window_end,
+                    "window_length_bp": win.window_end - win.window_start,
+                    "n_ir_pairs": win.n_ir_pairs,
+                    "ir_coords": ir_coords_str,
+                    "locus_tag": cds.locus_tag,
+                    "cds_start": cds.start + 1,  # 1-based
+                    "cds_end": cds.end,
+                    "strand": cds.strand,
+                    "product": cds.product,
+                    "cds_source": cds.source,
+                    "gff_path": win.gff_path,
+                })
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df.to_csv(output_path, sep="\t", index=False)
+    logger.info("Wrote shufflon window summary: %d rows -> %s", len(df), output_path)
+    return df
