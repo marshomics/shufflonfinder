@@ -418,6 +418,7 @@ def remap_ir_to_genome_coords(
 def filter_ir_table(
     ir_df: pd.DataFrame,
     min_arm_length: int = 0,
+    max_arm_length: int = 0,
     min_identity: float = 0.0,
 ) -> pd.DataFrame:
     """Filter inverted repeats by arm length and percent identity."""
@@ -434,6 +435,17 @@ def filter_ir_table(
         logger.info(
             "Arm-length filter (>= %d bp): %d -> %d IRs",
             min_arm_length, before, len(ir_df),
+        )
+
+    if max_arm_length > 0 and not ir_df.empty:
+        before_max = len(ir_df)
+        left_len = (ir_df["LeftIRStop"] - ir_df["LeftIRStart"]).abs() + 1
+        right_len = (ir_df["RightIRStop"] - ir_df["RightIRStart"]).abs() + 1
+        mask = (left_len <= max_arm_length) & (right_len <= max_arm_length)
+        ir_df = ir_df.loc[mask].copy()
+        logger.info(
+            "Arm-length filter (<= %d bp): %d -> %d IRs",
+            max_arm_length, before_max, len(ir_df),
         )
 
     if min_identity > 0 and not ir_df.empty:
