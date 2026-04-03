@@ -1,4 +1,4 @@
-name: shufflon-pipeline
+name: shufflonfinder
 channels:
   - conda-forge
   - bioconda
@@ -11,3 +11,4 @@ dependencies:
   - pip
   - pip:
     - phava
+    - -e .
