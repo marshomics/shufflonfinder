@@ -389,102 +389,117 @@ def find_intersecting_cds(ir_group, cds_features):
     return [cds for cds in cds_features if window.overlaps(cds)]
 
 
-def _find_invertible_segments(ir_group: list[Feature]) -> list[tuple[int, int]]:
-    """Identify invertible DNA segments between consecutive IR arms.
+def _find_invertible_cassettes(
+    ir_group: list[Feature],
+) -> list[tuple[int, int]]:
+    """Identify invertible cassettes from IR pairs in a shufflon cluster.
 
-    In a shufflon, the recognition sites (IR arms) flank invertible gene
-    cassettes.  This function finds the segments between the right arm of
-    one IR pair and the left arm of the next (sorted by position), which
-    correspond to the invertible cassettes.
+    Each einverted-detected IR pair defines one invertible cassette: the
+    DNA spanning from the left arm through to the right arm (inclusive).
+    The cassette boundaries include the repeat arms themselves because
+    the coding sequences within shufflon cassettes typically overlap the
+    sfx recognition sites.
 
-    Returns a list of (start, end) tuples in the same coordinate space as
-    the input features (0-based start, 1-based end).
+    Overlapping cassettes (from einverted detecting different pairwise
+    combinations of sfx sites) are merged.
+
+    Returns a list of (start, end) tuples in the same coordinate space
+    as the input features (0-based start, 1-based end).
     """
-    # Collect all individual arm positions
-    arms = []
+    # Group IR features into left/right pairs by their ID prefix
+    pairs = {}
     for ir in ir_group:
-        arms.append((ir.start, ir.end))
-    arms.sort()
+        attrs = _parse_gff_attributes(ir.attributes)
+        ir_id = attrs.get("ID", "")
+        if ir_id.endswith("_F"):
+            pairs.setdefault(ir_id[:-2], {})["F"] = ir
+        elif ir_id.endswith("_R"):
+            pairs.setdefault(ir_id[:-2], {})["R"] = ir
+        else:
+            pairs.setdefault(ir_id, {})["?"] = ir
 
-    # Segments are the gaps between consecutive arms
-    segments = []
-    for i in range(len(arms) - 1):
-        gap_start = arms[i][1]      # end of current arm
-        gap_end = arms[i + 1][0]    # start of next arm
-        if gap_end > gap_start + 30:  # minimum 30bp to be a real segment
-            segments.append((gap_start, gap_end))
+    # Each pair defines a cassette span
+    raw_cassettes = []
+    for pair_id, sides in pairs.items():
+        f = sides.get("F")
+        r = sides.get("R")
+        if f and r:
+            span_start = min(f.start, r.start)
+            span_end = max(f.end, r.end)
+            raw_cassettes.append((span_start, span_end))
 
-    return segments
+    if not raw_cassettes:
+        return []
+
+    # Sort by start position but do NOT merge overlapping cassettes.
+    # Adjacent shufflon cassettes share a boundary repeat (~19 bp overlap),
+    # and merging would collapse distinct invertible units into one.
+    raw_cassettes.sort()
+    return raw_cassettes
 
 
-def _find_orfs_in_segment(
+def _longest_orf_per_strand(
     seq: str,
     seg_start: int,
     seg_end: int,
-    min_aa: int = 30,
+    min_aa: int = 20,
 ) -> list[tuple[int, int, str]]:
-    """Find open reading frames within a DNA segment.
+    """Find the longest ORF on each strand within a DNA segment.
 
-    Searches all 6 reading frames for the longest ORF in the segment.
-    Returns list of (start, end, strand) tuples in genome coordinates.
+    Shufflon cassettes can carry one or two coding sequences (one per
+    strand).  These are partial genes (truncated C-terminal segments)
+    that may lack a canonical start or stop codon at the cassette
+    boundaries.  For each strand, this function finds the longest run
+    of codons without an internal stop across all three reading frames.
+
+    Returns a list of up to 2 (start, end, strand) tuples in genome
+    coordinates.
     """
     segment_seq = seq[seg_start:seg_end]
     if len(segment_seq) < min_aa * 3:
         return []
 
     complement = str.maketrans("ACGTacgtNn", "TGCAtgcaNn")
+    results = []
 
-    orfs = []
     for strand, search_seq in [("+", segment_seq),
                                 ("-", segment_seq[::-1].translate(complement))]:
+        best = None  # (length_aa, genome_start, genome_end)
         for frame in range(3):
+            run_start = frame
             i = frame
             while i + 2 < len(search_seq):
                 codon = search_seq[i:i + 3].upper()
-                if codon in ("ATG", "GTG", "TTG"):
-                    # Found start, search for stop
-                    for j in range(i + 3, len(search_seq) - 2, 3):
-                        stop = search_seq[j:j + 3].upper()
-                        if stop in ("TAA", "TAG", "TGA"):
-                            orf_len_aa = (j - i) // 3
-                            if orf_len_aa >= min_aa:
-                                if strand == "+":
-                                    orfs.append((
-                                        seg_start + i,
-                                        seg_start + j + 3,
-                                        strand,
-                                    ))
-                                else:
-                                    rc_start = len(search_seq) - (j + 3)
-                                    rc_end = len(search_seq) - i
-                                    orfs.append((
-                                        seg_start + rc_start,
-                                        seg_start + rc_end,
-                                        strand,
-                                    ))
-                            i = j + 3
-                            break
-                    else:
-                        # No stop found; check if remaining ORF is long enough
-                        remaining_aa = (len(search_seq) - i) // 3
-                        if remaining_aa >= min_aa:
-                            if strand == "+":
-                                orfs.append((
-                                    seg_start + i,
-                                    seg_start + len(search_seq),
-                                    strand,
-                                ))
-                            else:
-                                orfs.append((
-                                    seg_start,
-                                    seg_start + len(search_seq) - i,
-                                    strand,
-                                ))
-                        break
-                else:
-                    i += 3
+                if codon in ("TAA", "TAG", "TGA"):
+                    run_len_aa = (i - run_start) // 3
+                    if run_len_aa >= min_aa:
+                        if strand == "+":
+                            gs = seg_start + run_start
+                            ge = seg_start + i
+                        else:
+                            gs = seg_start + len(search_seq) - i
+                            ge = seg_start + len(search_seq) - run_start
+                        if best is None or run_len_aa > best[0]:
+                            best = (run_len_aa, gs, ge)
+                    run_start = i + 3
+                i += 3
 
-    return orfs
+            # Handle run extending to end of segment (partial gene)
+            run_len_aa = (i - run_start) // 3
+            if run_len_aa >= min_aa:
+                if strand == "+":
+                    gs = seg_start + run_start
+                    ge = seg_start + i
+                else:
+                    gs = seg_start + len(search_seq) - i
+                    ge = seg_start + len(search_seq) - run_start
+                if best is None or run_len_aa > best[0]:
+                    best = (run_len_aa, gs, ge)
+
+        if best is not None:
+            results.append((best[1], best[2], strand))
+
+    return results
 
 
 def _find_nearby_hmm_hits(
@@ -591,12 +606,13 @@ def extract_shufflon_windows(
                 f"{input_prefix}_contig_{contig_id}_window_{wnum}.gff",
             )
 
-            # Find invertible segments between IR arms and ORFs within them
-            inv_segments = _find_invertible_segments(ir_group)
-            segment_orfs = []
-            for seg_s, seg_e in inv_segments:
-                orfs = _find_orfs_in_segment(seq, seg_s, seg_e, min_aa=30)
-                segment_orfs.extend(orfs)
+            # Find invertible cassettes from IR pairs and their ORFs
+            cassettes = _find_invertible_cassettes(ir_group)
+            segment_orfs = []  # (seg_index, start, end, strand)
+            for si, (seg_s, seg_e) in enumerate(cassettes):
+                orfs = _longest_orf_per_strand(seq, seg_s, seg_e, min_aa=20)
+                for orf_s, orf_e, orf_strand in orfs:
+                    segment_orfs.append((si, orf_s, orf_e, orf_strand))
 
             with open(out_path, "w") as fh:
                 fh.write("##gff-version 3\n")
@@ -625,8 +641,8 @@ def extract_shufflon_windows(
                         f"{cds.strand}\t.\t{cds.attributes}\n"
                     )
 
-                # Track 4: invertible segments (DNA between IR arms)
-                for si, (seg_s, seg_e) in enumerate(inv_segments, start=1):
+                # Track 4: invertible cassettes (DNA spanning IR pairs)
+                for si, (seg_s, seg_e) in enumerate(cassettes, start=1):
                     local_s = seg_s - win_start + 1
                     local_e = seg_e - win_start
                     seg_len = seg_e - seg_s
@@ -637,15 +653,14 @@ def extract_shufflon_windows(
                         f"Name=Invertible segment {si} ({seg_len} bp)\n"
                     )
 
-                # Track 5: predicted ORFs within invertible segments
-                # (only those not already covered by Prokka CDS)
-                prokka_spans = set()
-                for cds in intersecting_cds:
-                    prokka_spans.add((cds.start, cds.end))
+                # Track 5: predicted cassette CDS within invertible segments
+                # One per segment (the longest ORF), skipping any already
+                # covered by a Prokka CDS annotation.
+                prokka_spans = [(cds.start, cds.end) for cds in intersecting_cds]
 
                 orf_counter = 0
-                for orf_s, orf_e, orf_strand in segment_orfs:
-                    # Skip if a Prokka CDS already covers this region
+                for seg_idx, orf_s, orf_e, orf_strand in segment_orfs:
+                    # Skip if a Prokka CDS substantially overlaps this ORF
                     covered = any(
                         cs <= orf_s and ce >= orf_e
                         for cs, ce in prokka_spans
@@ -659,11 +674,13 @@ def extract_shufflon_windows(
                     fh.write(
                         f"{seq_id}\tshufflonfinder\tCDS\t"
                         f"{local_s}\t{local_e}\t.\t{orf_strand}\t0\t"
-                        f"ID=shufflon_orf_{orf_counter:03d};"
-                        f"Name=Predicted shufflon cassette ORF "
+                        f"ID=shufflon_cassette_{orf_counter:03d};"
+                        f"Name=Shufflon cassette {orf_counter} "
                         f"({orf_len_aa} aa);"
                         f"product=putative shufflon cassette protein;"
-                        f"inference=ab initio prediction:shufflonfinder\n"
+                        f"inference=ab initio prediction:shufflonfinder;"
+                        f"note=partial;truncated C-terminal segment "
+                        f"in invertible segment {seg_idx + 1}\n"
                     )
 
                 fh.write("##FASTA\n")
