@@ -4,8 +4,8 @@ shufflonfinder: Annotate shufflon structures in bacterial genomes.
 
 Searches proteins against a library of shufflon-associated HMM profiles,
 extracts flanking DNA (±5 kb by default) around each hit, detects inverted
-repeats in those flanking regions (via PHAVA), and merges all annotations
-into Prokka GFF files with windowed output.
+repeats in those flanking regions (via EMBOSS einverted), and merges all
+annotations into Prokka GFF files with windowed output.
 
 Usage:
     # From raw genome FASTAs (runs Prokka first):
@@ -44,12 +44,13 @@ from .step_flanking import (
     extract_flanking_regions,
     flanking_regions_to_tsv,
 )
-from .step_phava import run_phava_on_flanking, combine_ir_tables
+from .step_phava import detect_inverted_repeats, combine_ir_tables, filter_ir_table
 from .step_gff import (
     hmm_hits_to_gff,
     ir_to_gff,
     merge_gff_into_prokka,
     extract_shufflon_windows,
+    shufflon_windows_to_tsv,
 )
 
 logger = logging.getLogger("shufflonfinder")
@@ -116,6 +117,14 @@ def parse_args(argv=None):
         help="Window size (bp) for clustering nearby IRs (default: 3000).",
     )
     p.add_argument(
+        "--min-ir-arm-length", type=int, default=10,
+        help="Minimum IR arm length in bp to keep (default: 10).",
+    )
+    p.add_argument(
+        "--min-ir-identity", type=float, default=70.0,
+        help="Minimum percent identity between IR arms to keep (default: 70.0).",
+    )
+    p.add_argument(
         "--skip-prokka", action="store_true",
         help="Skip Prokka even for FASTA inputs (implies .faa/.gff exist alongside .fna).",
     )
@@ -158,7 +167,7 @@ def main(argv=None):
     logger.info("Output directory: %s", outdir)
 
     # ---- Check external tools ----
-    required_tools = ["hmmsearch", "hmmpress", "phava"]
+    required_tools = ["hmmsearch", "hmmpress", "einverted"]
     if not args.sample_sheet and not args.skip_prokka:
         required_tools.append("prokka")
 
@@ -172,7 +181,7 @@ def main(argv=None):
         "hmm_profiles": ensure_dir(os.path.join(outdir, "02_hmmsearch", "profiles")),
         "hmm_results":  ensure_dir(os.path.join(outdir, "02_hmmsearch", "results")),
         "flanking":     ensure_dir(os.path.join(outdir, "03_flanking")),
-        "phava":        ensure_dir(os.path.join(outdir, "04_phava")),
+        "ir":           ensure_dir(os.path.join(outdir, "04_inverted_repeats")),
         "gff_hmm":      ensure_dir(os.path.join(outdir, "05_gff", "hmm_hits")),
         "gff_ir":       ensure_dir(os.path.join(outdir, "05_gff", "ir")),
         "gff_merged":   ensure_dir(os.path.join(outdir, "05_gff", "merged")),
@@ -252,21 +261,35 @@ def main(argv=None):
         flanking_regions_to_tsv(all_flanking_flat, flanking_tsv)
 
     # ==================================================================
-    # Step 4: PHAVA inverted repeat detection on flanking regions
+    # Step 4: Inverted repeat detection (einverted) on flanking regions
     # ==================================================================
     logger.info("=" * 60)
-    logger.info("STEP 4: PHAVA inverted repeat detection (flanking regions)")
+    logger.info("STEP 4: Inverted repeat detection (flanking regions)")
     logger.info("=" * 60)
 
-    phava_results = []  # (phava_dir, sample_id, flanking_regions)
+    ir_results = []  # (ir_dir, sample_id, flanking_regions)
     for sample, fasta_path, regions in all_flanking_regions:
         if not regions:
             continue
-        pdir = run_phava_on_flanking(sample, fasta_path, dirs["phava"], cpus=args.cpus)
-        phava_results.append((pdir, sample.sample_id, regions))
+        ir_dir = detect_inverted_repeats(
+            sample, fasta_path, dirs["ir"], cpus=args.cpus,
+        )
+        ir_results.append((ir_dir, sample.sample_id, regions))
 
-    ir_combined_path = os.path.join(dirs["phava"], "IRs_combined_remapped.tsv")
-    ir_df = combine_ir_tables(phava_results, ir_combined_path)
+    ir_combined_path = os.path.join(dirs["ir"], "IRs_combined_remapped.tsv")
+    ir_df = combine_ir_tables(ir_results, ir_combined_path)
+
+    # Apply IR quality filters
+    if args.min_ir_arm_length > 0 or args.min_ir_identity > 0:
+        ir_df = filter_ir_table(
+            ir_df,
+            min_arm_length=args.min_ir_arm_length,
+            min_identity=args.min_ir_identity,
+        )
+        # Write filtered version alongside the unfiltered one
+        ir_filtered_path = os.path.join(dirs["ir"], "IRs_combined_filtered.tsv")
+        ir_df.to_csv(ir_filtered_path, sep="\t", index=False)
+        logger.info("Filtered IR table: %d records -> %s", len(ir_df), ir_filtered_path)
 
     # ==================================================================
     # Step 5: Generate and merge GFF files
@@ -309,9 +332,14 @@ def main(argv=None):
         windows = extract_shufflon_windows(
             merged_gff,
             os.path.join(dirs["windows"], sample.sample_id),
+            sample_id=sample.sample_id,
             window_size=args.window_size,
         )
         all_windows.extend(windows)
+
+    # Write combined summary table
+    summary_path = os.path.join(dirs["windows"], "shufflon_windows_summary.tsv")
+    summary_df = shufflon_windows_to_tsv(all_windows, summary_path)
 
     # ==================================================================
     # Summary
