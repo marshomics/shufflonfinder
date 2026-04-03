@@ -27,8 +27,11 @@ def hmm_hits_to_gff(
 ) -> dict[str, str]:
     """Convert HMM hit proteins into per-sample GFF annotation files.
 
-    Each hit becomes a CDS feature with source set to the HMM profile name.
-    Coordinates are looked up from the sample's Prokka GFF.
+    Each hit becomes an ``hmm_hit`` feature (a distinct GFF type, separate
+    from the Prokka CDS) with source ``shufflonfinder`` and the matching
+    HMM profile recorded in the attributes.  This lets downstream window
+    extraction identify HMM hit genes unambiguously and render them as
+    their own annotation track.
 
     Args:
         hmm_hits_df: Filtered HMM hits DataFrame with columns:
@@ -47,6 +50,12 @@ def hmm_hits_to_gff(
 
     sample_map = {s.sample_id: s for s in samples}
 
+    # Collect all profiles per protein so we can write them once per gene
+    profiles_per_gene = (
+        hmm_hits_df.groupby(["genome", "target_name"])["hmm_profile"]
+        .apply(lambda x: ";".join(sorted(set(x))))
+    )
+
     grouped = hmm_hits_df.groupby("genome")
     for sample_id, group in grouped:
         sample = sample_map.get(sample_id)
@@ -54,29 +63,34 @@ def hmm_hits_to_gff(
             logger.warning("Sample %s not found, skipping GFF generation", sample_id)
             continue
 
-        # Parse CDS coordinates from this sample's GFF
         cds_map = parse_cds_from_gff(sample.gff_path)
 
         gff_path = os.path.join(output_dir, f"{sample_id}_hmm_hits.gff")
         written = 0
+        seen = set()
         with open(gff_path, "w") as fh:
             for _, row in group.iterrows():
                 protein_id = row["target_name"]
-                hmm_profile = row["hmm_profile"]
+                if protein_id in seen:
+                    continue
+                seen.add(protein_id)
 
                 cds = cds_map.get(protein_id)
                 if cds is None:
                     continue
 
+                profiles = profiles_per_gene.get((sample_id, protein_id), row["hmm_profile"])
+
                 attrs = (
-                    f"ID={cds.locus_tag};"
-                    f"Parent={cds.locus_tag}_gene;"
-                    f"Name={hmm_profile}"
+                    f"ID=hmm_hit_{cds.locus_tag};"
+                    f"locus_tag={cds.locus_tag};"
+                    f"hmm_profiles={profiles};"
+                    f"Name=HMM hit: {profiles}"
                 )
                 fields = [
                     cds.contig,
-                    hmm_profile,
-                    "CDS",
+                    "shufflonfinder",
+                    "hmm_hit",
                     str(cds.start),
                     str(cds.end),
                     ".",
@@ -280,6 +294,7 @@ class ShufflonWindow:
     n_ir_pairs: int
     ir_features: list[Feature] = field(default_factory=list)
     cds_features: list[Feature] = field(default_factory=list)
+    hmm_hit_features: list[Feature] = field(default_factory=list)
     gff_path: str = ""
 
 
@@ -287,11 +302,12 @@ def parse_gff_with_fasta(gff_path: str):
     """Parse a GFF file (with embedded FASTA) into features and sequences.
 
     Returns:
-        Tuple of (ir_by_contig, cds_by_contig, sequences)
-        where sequences is a dict of contig_id -> (header, sequence_str).
+        Tuple of (ir_by_contig, cds_by_contig, hmm_by_contig, sequences)
+        where sequences is a dict of contig_id -> sequence_str.
     """
     ir_by_contig = defaultdict(list)
     cds_by_contig = defaultdict(list)
+    hmm_by_contig = defaultdict(list)
     fasta_lines = []
     in_fasta = False
 
@@ -321,6 +337,8 @@ def parse_gff_with_fasta(gff_path: str):
 
             if feat.type == "inverted_repeat":
                 ir_by_contig[feat.seqid].append(feat)
+            elif feat.type == "hmm_hit":
+                hmm_by_contig[feat.seqid].append(feat)
             elif feat.type == "CDS":
                 cds_by_contig[feat.seqid].append(feat)
 
@@ -339,7 +357,7 @@ def parse_gff_with_fasta(gff_path: str):
     if current_id:
         sequences[current_id] = "".join(current_seq)
 
-    return ir_by_contig, cds_by_contig, sequences
+    return ir_by_contig, cds_by_contig, hmm_by_contig, sequences
 
 
 def group_features_by_window(features: list[Feature], window_size: int = 3000):
@@ -371,6 +389,28 @@ def find_intersecting_cds(ir_group, cds_features):
     return [cds for cds in cds_features if window.overlaps(cds)]
 
 
+def _find_nearby_hmm_hits(
+    ir_group: list[Feature],
+    hmm_features: list[Feature],
+    window_size: int,
+) -> list[Feature]:
+    """Find hmm_hit features near an IR cluster.
+
+    An HMM hit is included if it overlaps the IR span or is within
+    window_size bp of any IR feature in the group.
+    """
+    group_start = min(ir.start for ir in ir_group)
+    group_end = max(ir.end for ir in ir_group)
+    seqid = ir_group[0].seqid
+    expanded = Feature(
+        seqid, ".", "window",
+        max(0, group_start - window_size),
+        group_end + window_size,
+        "+", "",
+    )
+    return [h for h in hmm_features if expanded.overlaps(h)]
+
+
 def extract_shufflon_windows(
     merged_gff: str,
     output_dir: str,
@@ -379,9 +419,10 @@ def extract_shufflon_windows(
 ) -> list[ShufflonWindow]:
     """Extract GFF+FASTA windows where inverted repeats co-locate with CDS features.
 
-    This is the final filtering step: for each cluster of nearby IRs, find
-    overlapping CDS features and write a self-contained GFF with the windowed
-    sequence.
+    For each cluster of nearby IRs, finds overlapping CDS features and nearby
+    HMM hit features (within window_size).  The HMM hit gene that originally
+    triggered the flanking region extraction is always included and written
+    as a separate ``hmm_hit`` annotation track in the per-window GFF.
 
     Args:
         merged_gff: Path to a merged GFF (Prokka + HMM + IR annotations, with FASTA).
@@ -395,7 +436,7 @@ def extract_shufflon_windows(
     ensure_dir(output_dir)
     input_prefix = os.path.splitext(os.path.basename(merged_gff))[0]
 
-    ir_by_contig, cds_by_contig, sequences = parse_gff_with_fasta(merged_gff)
+    ir_by_contig, cds_by_contig, hmm_by_contig, sequences = parse_gff_with_fasta(merged_gff)
 
     if not sequences:
         logger.warning("No FASTA sequences found in %s", merged_gff)
@@ -407,27 +448,43 @@ def extract_shufflon_windows(
     for contig_id, ir_features in ir_by_contig.items():
         ir_groups = group_features_by_window(ir_features, window_size)
         contig_cds = cds_by_contig.get(contig_id, [])
+        contig_hmm = hmm_by_contig.get(contig_id, [])
         seq = sequences.get(contig_id, "")
         seq_len = len(seq)
 
         for ir_group in ir_groups:
-            intersecting = find_intersecting_cds(ir_group, contig_cds)
-            if not intersecting:
+            intersecting_cds = find_intersecting_cds(ir_group, contig_cds)
+            nearby_hmm = _find_nearby_hmm_hits(ir_group, contig_hmm, window_size)
+
+            # A window must have at least CDS or HMM hit features
+            if not intersecting_cds and not nearby_hmm:
                 continue
 
             window_counter[contig_id] += 1
             wnum = window_counter[contig_id]
 
-            # Calculate window bounds
-            ir_start = min(ir.start for ir in ir_group)
-            ir_end = max(ir.end for ir in ir_group)
-            cds_start = min(c.start for c in intersecting)
-            cds_end = max(c.end for c in intersecting)
-            win_start = max(0, min(ir_start, cds_start))
-            win_end = min(seq_len, max(ir_end, cds_end))
+            # Calculate window bounds including all feature types
+            all_starts = [ir.start for ir in ir_group]
+            all_ends = [ir.end for ir in ir_group]
+            for c in intersecting_cds:
+                all_starts.append(c.start)
+                all_ends.append(c.end)
+            for h in nearby_hmm:
+                all_starts.append(h.start)
+                all_ends.append(h.end)
+
+            win_start = max(0, min(all_starts))
+            win_end = min(seq_len, max(all_ends))
 
             if win_start >= win_end:
                 continue
+
+            # Collect any CDS that fall within the (possibly expanded) window
+            # bounds, since HMM hit inclusion may have widened it
+            win_span = Feature(contig_id, ".", "window", win_start, win_end, "+", "")
+            intersecting_cds = [
+                c for c in contig_cds if win_span.overlaps(c)
+            ]
 
             seq_id = f"{input_prefix}_{contig_id}_{wnum}"
             window_id = f"{sample_id}_{contig_id}_w{wnum}" if sample_id else seq_id
@@ -438,22 +495,34 @@ def extract_shufflon_windows(
 
             with open(out_path, "w") as fh:
                 fh.write("##gff-version 3\n")
+
+                # Track 1: inverted repeats
                 for ir in ir_group:
                     fh.write(
-                        f"{seq_id}\t.\tinverted_repeat\t"
+                        f"{seq_id}\teinverted\tinverted_repeat\t"
                         f"{ir.start - win_start + 1}\t{ir.end - win_start}\t.\t"
                         f"{ir.strand}\t.\t{ir.attributes}\n"
                     )
-                for cds in intersecting:
+
+                # Track 2: HMM hits
+                for hmm in nearby_hmm:
                     fh.write(
-                        f"{seq_id}\t.\tCDS\t"
+                        f"{seq_id}\tshufflonfinder\thmm_hit\t"
+                        f"{hmm.start - win_start + 1}\t{hmm.end - win_start}\t.\t"
+                        f"{hmm.strand}\t.\t{hmm.attributes}\n"
+                    )
+
+                # Track 3: CDS features
+                for cds in intersecting_cds:
+                    fh.write(
+                        f"{seq_id}\t{cds.source}\tCDS\t"
                         f"{cds.start - win_start + 1}\t{cds.end - win_start}\t.\t"
                         f"{cds.strand}\t.\t{cds.attributes}\n"
                     )
+
                 fh.write("##FASTA\n")
                 fh.write(f">{seq_id}\n{seq[win_start:win_end]}\n")
 
-            # IR features come in pairs (F/R), so count pairs
             n_ir_pairs = len(ir_group) // 2
 
             win = ShufflonWindow(
@@ -464,7 +533,8 @@ def extract_shufflon_windows(
                 window_end=win_end,
                 n_ir_pairs=n_ir_pairs,
                 ir_features=list(ir_group),
-                cds_features=list(intersecting),
+                cds_features=list(intersecting_cds),
+                hmm_hit_features=list(nearby_hmm),
                 gff_path=out_path,
             )
             windows.append(win)
@@ -479,15 +549,12 @@ def shufflon_windows_to_tsv(
     windows: list[ShufflonWindow],
     output_path: str,
 ) -> pd.DataFrame:
-    """Write a summary table of all shufflon windows with IR and CDS details.
+    """Write a summary table of all shufflon windows with IR, CDS, and HMM hit details.
 
-    Each row represents one CDS feature within a window. IR information for
-    the window is repeated on every row.
-
-    Columns:
-        sample_id, window_id, contig, window_start, window_end,
-        n_ir_pairs, ir_coords, locus_tag, cds_start, cds_end, strand,
-        product, cds_source, gff_path
+    Each row represents one CDS feature within a window.  Window-level info
+    (IR coordinates, HMM hit gene) is repeated on every row.  CDS features
+    whose locus_tag matches an HMM hit in the same window are flagged with
+    ``is_hmm_hit=True`` and the matching ``hmm_profiles``.
 
     Args:
         windows: List of ShufflonWindow objects.
@@ -498,8 +565,7 @@ def shufflon_windows_to_tsv(
     """
     rows = []
     for win in windows:
-        # Build a compact string summarising all IR pair coordinates in this window
-        # Group IR features into pairs by their ID prefix (strip _F/_R suffix)
+        # Build compact IR coordinate string
         ir_pairs = defaultdict(dict)
         for ir in win.ir_features:
             attrs = _parse_gff_attributes(ir.attributes)
@@ -525,45 +591,59 @@ def shufflon_windows_to_tsv(
                 ir_coord_parts.append(f"{r.start + 1}-{r.end}")
         ir_coords_str = "; ".join(ir_coord_parts) if ir_coord_parts else ""
 
+        # Build a lookup: locus_tag -> hmm_profiles for HMM hit genes in
+        # this window, so we can flag matching CDS rows
+        hmm_lookup = {}
+        for hmm in win.hmm_hit_features:
+            attrs = hmm.parsed_attributes
+            tag = attrs.get("locus_tag", "")
+            profiles = attrs.get("hmm_profiles", "")
+            if tag:
+                hmm_lookup[tag] = profiles
+
+        # Shared window-level columns
+        base = {
+            "sample_id": win.sample_id,
+            "window_id": win.window_id,
+            "contig": win.contig,
+            "window_start": win.window_start + 1,  # 1-based
+            "window_end": win.window_end,
+            "window_length_bp": win.window_end - win.window_start,
+            "n_ir_pairs": win.n_ir_pairs,
+            "ir_coords": ir_coords_str,
+        }
+
         if not win.cds_features:
-            # Window with no CDS (shouldn't happen given the filtering, but
-            # include a row for completeness)
-            rows.append({
-                "sample_id": win.sample_id,
-                "window_id": win.window_id,
-                "contig": win.contig,
-                "window_start": win.window_start + 1,  # 1-based for output
-                "window_end": win.window_end,
-                "window_length_bp": win.window_end - win.window_start,
-                "n_ir_pairs": win.n_ir_pairs,
-                "ir_coords": ir_coords_str,
+            row = dict(base)
+            row.update({
                 "locus_tag": "",
                 "cds_start": "",
                 "cds_end": "",
                 "strand": "",
                 "product": "",
                 "cds_source": "",
+                "is_hmm_hit": False,
+                "hmm_profiles": "",
                 "gff_path": win.gff_path,
             })
+            rows.append(row)
         else:
             for cds in win.cds_features:
-                rows.append({
-                    "sample_id": win.sample_id,
-                    "window_id": win.window_id,
-                    "contig": win.contig,
-                    "window_start": win.window_start + 1,
-                    "window_end": win.window_end,
-                    "window_length_bp": win.window_end - win.window_start,
-                    "n_ir_pairs": win.n_ir_pairs,
-                    "ir_coords": ir_coords_str,
-                    "locus_tag": cds.locus_tag,
-                    "cds_start": cds.start + 1,  # 1-based
+                tag = cds.locus_tag
+                hit_profiles = hmm_lookup.get(tag, "")
+                row = dict(base)
+                row.update({
+                    "locus_tag": tag,
+                    "cds_start": cds.start + 1,
                     "cds_end": cds.end,
                     "strand": cds.strand,
                     "product": cds.product,
                     "cds_source": cds.source,
+                    "is_hmm_hit": bool(hit_profiles),
+                    "hmm_profiles": hit_profiles,
                     "gff_path": win.gff_path,
                 })
+                rows.append(row)
 
     df = pd.DataFrame(rows)
     if not df.empty:
