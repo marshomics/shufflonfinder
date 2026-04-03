@@ -1,0 +1,13 @@
+name: shufflon-pipeline
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python>=3.9
+  - prokka>=1.14
+  - hmmer>=3.3
+  - biopython>=1.80
+  - pandas>=1.5
+  - pip
+  - pip:
+    - phava
