@@ -1,4 +1,4 @@
-# ShufflonFinder
+# shufflonfinder
 
 Annotate shufflon structures in bacterial genomes. Searches predicted proteins against a library of HMM profiles targeting shufflon-associated recombinases (e.g. Rci), extracts flanking DNA around each hit, detects inverted repeats in those flanking regions using EMBOSS einverted, applies motif-based refinement to recover sfx recognition sites missed by pairwise alignment, filters for dense IR clusters, and produces merged GFF annotations with windowed output and gene-organisation plots for each candidate shufflon locus.
 
@@ -23,7 +23,7 @@ The pipeline runs eight steps in sequence:
 
 8. **Window extraction** identifies CDS features overlapping each shufflon candidate cluster, finds invertible DNA segments between consecutive IR arms, and writes self-contained GFF+FASTA files for each candidate shufflon region. Each window GFF carries four annotation tracks: `inverted_repeat` features (from einverted and motif search, named `inverted_repeat_NN_FOR`/`inverted_repeat_NN_REV`), `hmm_hit` features (the recombinase gene with HMM profile info), `CDS` features (overlapping Prokka genes), and `invertible_segment` features (the DNA between consecutive IR arms, corresponding to shufflon cassettes).
 
-9. **Plot generation** produces PNG and SVG gene-organisation figures for each window GFF using [dna_features_viewer](https://github.com/Edinburgh-Genome-Foundry/DnaFeaturesViewer). Each plot has two tracks: a top track with directional arrows for CDS, inverted repeats, and the recombinase, and a bottom track with undirectional boxes for invertible segments. Features are colour-coded by category: recombinases (red), inverted repeats (steel blue), invertible segments (orange), CDS containing inverted repeats (teal), and other CDS (grey). Plot files are written to a `plots/` subdirectory within `07_shufflon_windows/`.
+9. **Plot generation** produces PNG and SVG gene-organisation figures for each window GFF using [dna_features_viewer](https://github.com/Edinburgh-Genome-Foundry/DnaFeaturesViewer). Each plot has three visual tracks: inverted repeats as directional arrows above the annotation line, CDS and recombinase as directional arrows on the main line, and invertible segments as undirectional boxes below. Features are identified by colour via a shared legend: recombinases (red), inverted repeats (steel blue), invertible segments (orange), CDS containing inverted repeats (teal), and other CDS (grey). Plot files are written to `07_shufflon_windows/plots/`.
 
 
 ## Prerequisites
@@ -158,28 +158,34 @@ The directory can contain `.hmm` or `.hmm.gz` files. Each file should hold one H
 
 ```
 results/
-├── 01_prokka/                      # Prokka outputs per sample (when run)
+├── 01_prokka/
+│   └── <sample_id>/                  # Prokka outputs per sample (when run)
 ├── 02_hmmsearch/
-│   ├── profiles/                   # Decompressed, hmmpress'd profiles
-│   ├── results/<sample_id>/        # Per-sample, per-profile tblout files
-│   └── hmm_hits_combined.tsv       # All hits above the bitscore threshold
+│   ├── profiles/                     # Decompressed, hmmpress'd profiles
+│   ├── results/
+│   │   └── <sample_id>/              # Per-profile tblout files
+│   └── hmm_hits_combined.tsv         # All hits above the bitscore threshold
 ├── 03_flanking/
-│   ├── <sample_id>_flanking.fasta  # Flanking DNA around each hit protein
+│   ├── <sample_id>/                  # Flanking DNA FASTA per sample
 │   └── flanking_regions_combined.tsv
 ├── 04_inverted_repeats/
-│   ├── <sample_id>/                # einverted output + IRs.tsv per sample
-│   ├── IRs_combined_remapped.tsv   # All IRs in genome-absolute coordinates
-│   └── IRs_combined_filtered.tsv   # After arm-length and identity filters
+│   ├── <sample_id>/                  # einverted output + IRs.tsv per sample
+│   ├── IRs_combined_remapped.tsv     # All IRs in genome-absolute coordinates
+│   └── IRs_combined_filtered.tsv     # After arm-length and identity filters
 ├── 05_shufflon_filter/
-│   └── IRs_shufflon_candidates.tsv # After density + CDS overlap + motif refinement
+│   └── IRs_shufflon_candidates.tsv   # After density + CDS overlap + motif refinement
 ├── 06_gff/
-│   ├── hmm_hits/                   # HMM hit CDS features as GFF
-│   ├── ir/                         # IR features as GFF
-│   └── merged/                     # Prokka + HMM + IR merged GFFs
+│   ├── hmm_hits/
+│   │   └── <sample_id>/              # HMM hit features as GFF
+│   ├── ir/
+│   │   └── <sample_id>/              # IR features as GFF
+│   └── merged/
+│       └── <sample_id>/              # Prokka + HMM + IR merged GFF
 └── 07_shufflon_windows/
     ├── shufflon_windows_summary.tsv  # Combined summary table (all samples)
-    ├── <sample_id>/                  # Per-window GFF+FASTA files
-    └── plots/                        # Gene-organisation figures
+    ├── gffs/
+    │   └── <sample_id>/              # Per-window GFF+FASTA files
+    └── plots/
         └── <sample_id>/              # Per-window .png and .svg plots
 ```
 
@@ -195,9 +201,9 @@ results/
 
 `07_shufflon_windows/shufflon_windows_summary.tsv` is the main results table. Each row represents one CDS feature within a candidate shufflon window. Columns include `sample_id`, `window_id`, `contig`, `window_start`, `window_end`, `window_length_bp`, `n_ir_pairs`, `ir_coords` (compact coordinate string for all IR pairs in the window), `locus_tag` (Prokka ID), `cds_start`, `cds_end`, `strand`, `product` (Prokka annotation), `cds_source`, `is_hmm_hit` (True if this CDS is the gene that triggered the HMM search), `hmm_profiles` (semicolon-separated profiles that matched, empty for non-hit genes), and `gff_path` (path to the per-window GFF+FASTA file).
 
-`07_shufflon_windows/<sample_id>/` contains one GFF+FASTA file per candidate shufflon region. Each GFF has four annotation tracks: `inverted_repeat` features (from einverted or motif_search, named `inverted_repeat_NN_FOR`/`inverted_repeat_NN_REV`), `hmm_hit` features (the recombinase gene), `CDS` features (overlapping Prokka genes), and `invertible_segment` features (the DNA between consecutive IR arms).
+`07_shufflon_windows/gffs/<sample_id>/` contains one GFF+FASTA file per candidate shufflon region. Each GFF has four annotation tracks: `inverted_repeat` features (from einverted or motif_search, named `inverted_repeat_NN_FOR`/`inverted_repeat_NN_REV`), `hmm_hit` features (the recombinase gene), `CDS` features (overlapping Prokka genes), and `invertible_segment` features (the DNA between consecutive IR arms).
 
-`07_shufflon_windows/plots/<sample_id>/` contains PNG and SVG gene-organisation figures for each window. The top track shows directional arrows for CDS, inverted repeats, and recombinases; the bottom track shows undirectional boxes for invertible segments. All features are colour-coded consistently across windows.
+`07_shufflon_windows/plots/<sample_id>/` contains PNG and SVG gene-organisation figures for each window. Each figure has three visual tracks: inverted repeats as directional arrows above the annotation line, CDS and recombinase as directional arrows on the main line, and invertible segments as undirectional boxes below. Features are identified by colour via a shared legend rather than inline labels.
 
 
 ## HMM profiles
