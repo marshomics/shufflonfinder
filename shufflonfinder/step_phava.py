@@ -655,3 +655,304 @@ def filter_shufflon_candidates(
         before, len(result), n_clusters, removed,
     )
     return result
+
+
+# ---------------------------------------------------------------------------
+# Motif-based refinement: detect sfx recognition sites missed by einverted
+# ---------------------------------------------------------------------------
+
+def _reverse_complement(seq: str) -> str:
+    """Return the reverse complement of a DNA sequence."""
+    complement = str.maketrans("ACGTacgtNn", "TGCAtgcaNn")
+    return seq[::-1].translate(complement)
+
+
+def _derive_core_motif(arm_sequences: list[str], min_core: int = 8) -> str:
+    """Derive the longest shared core substring from a set of sfx arm sequences.
+
+    All sfx-type recognition sites in a shufflon share a conserved core
+    (e.g., ``GCCAATCCGG`` in R64).  This function finds that core by
+    identifying the longest substring common to all input arm sequences.
+
+    Only forward-orientation arms should be passed in (the function
+    reverse-complements R-arms internally if needed).
+
+    Args:
+        arm_sequences: List of arm DNA sequences (all same orientation).
+        min_core: Minimum core length to accept.
+
+    Returns:
+        The longest common substring, or "" if none ≥ min_core.
+    """
+    if not arm_sequences:
+        return ""
+
+    # Use the shortest sequence as reference
+    ref = min(arm_sequences, key=len)
+    best = ""
+
+    for length in range(len(ref), min_core - 1, -1):
+        for start in range(len(ref) - length + 1):
+            candidate = ref[start:start + length].upper()
+            if all(candidate in s.upper() for s in arm_sequences):
+                return candidate
+
+    return best
+
+
+def refine_sfx_sites(
+    ir_df: pd.DataFrame,
+    sequences: dict[str, str],
+    search_margin: int = 500,
+) -> pd.DataFrame:
+    """Detect sfx recognition sites missed by einverted within shufflon clusters.
+
+    einverted finds IR pairs — sequences that are reverse complements of
+    each other.  In shufflons, the recognition sites (sfx sites) all share
+    a conserved core motif, but cross-type pairings may have too many
+    mismatches for einverted to detect.  This function:
+
+    1. Derives a consensus core motif from the arms already detected.
+    2. Searches the cluster region for all occurrences of the core
+       (forward and reverse strand).
+    3. Adds any site not already covered by a detected arm as a new
+       IR row, paired with its best-matching existing arm.
+
+    Args:
+        ir_df: Shufflon candidate IR DataFrame (with ``cluster_id``).
+        sequences: Dict of contig_id -> full genome sequence.
+        search_margin: Extra bp to search beyond the cluster span on
+            each side.
+
+    Returns:
+        Augmented DataFrame with additional IR rows for newly detected
+        sites.
+    """
+    if ir_df.empty or "cluster_id" not in ir_df.columns:
+        return ir_df
+
+    new_rows = []
+
+    for cluster_id, cluster in ir_df.groupby("cluster_id"):
+        contig = cluster["IR_Chr"].iloc[0]
+        seq = sequences.get(contig, "")
+        if not seq:
+            continue
+
+        # Collect all arm sequences, normalised to forward orientation
+        # Forward arms: LeftIRSequence; Reverse arms: RC of RightIRSequence
+        fwd_arms = []
+        for _, row in cluster.iterrows():
+            fwd_arms.append(str(row["LeftIRSequence"]).upper())
+            fwd_arms.append(_reverse_complement(str(row["RightIRSequence"])).upper())
+
+        core = _derive_core_motif(fwd_arms)
+        if not core or len(core) < 8:
+            logger.debug(
+                "Cluster %s: could not derive core motif (best=%r)",
+                cluster_id, core,
+            )
+            continue
+
+        core_rc = _reverse_complement(core)
+
+        # Determine search region
+        all_coords = []
+        for _, row in cluster.iterrows():
+            all_coords.extend([
+                int(row["LeftIRStart"]), int(row["LeftIRStop"]),
+                int(row["RightIRStart"]), int(row["RightIRStop"]),
+            ])
+        region_start = max(0, min(all_coords) - search_margin)
+        region_end = min(len(seq), max(all_coords) + search_margin)
+        region_seq = seq[region_start:region_end].upper()
+
+        # Collect existing arm spans to avoid duplicates
+        existing_spans = set()
+        for _, row in cluster.iterrows():
+            existing_spans.add((int(row["LeftIRStart"]), int(row["LeftIRStop"])))
+            existing_spans.add((int(row["RightIRStart"]), int(row["RightIRStop"])))
+
+        def _overlaps_existing(start: int, end: int, tolerance: int = 5) -> bool:
+            for es, ee in existing_spans:
+                if abs(start - es) <= tolerance and abs(end - ee) <= tolerance:
+                    return True
+                # Check if the new site is contained within an existing arm
+                if start >= es - tolerance and end <= ee + tolerance:
+                    return True
+                # Check reciprocal overlap: if >50% of either span overlaps
+                overlap_start = max(start, es)
+                overlap_end = min(end, ee)
+                if overlap_end > overlap_start:
+                    overlap_len = overlap_end - overlap_start
+                    new_len = max(1, end - start)
+                    exist_len = max(1, ee - es)
+                    if overlap_len / new_len > 0.5 or overlap_len / exist_len > 0.5:
+                        return True
+            return False
+
+        # Compute typical individual sfx site length from detected arms.
+        # einverted arms may span two abutting sites, so use the MINIMUM
+        # arm length as the best estimate for single-site width.
+        arm_lengths = []
+        for _, row in cluster.iterrows():
+            arm_lengths.append(int(row["LeftIRStop"]) - int(row["LeftIRStart"]))
+            arm_lengths.append(int(row["RightIRStop"]) - int(row["RightIRStart"]))
+        site_len = min(arm_lengths)
+
+        # Collect existing R-arm RCs and F-arm sequences for partner matching.
+        # This lets us determine the correct offset of the core within a site
+        # by trying multiple extensions and picking the one with best identity.
+        r_arm_rcs = []  # (rc_seq, row) for each existing pair
+        f_arm_seqs = []
+        for _, row in cluster.iterrows():
+            r_arm_rcs.append((_reverse_complement(str(row["RightIRSequence"])), row))
+            f_arm_seqs.append((str(row["LeftIRSequence"]), row))
+
+        def _best_site_boundaries(
+            core_genome_pos: int, strand: str,
+        ) -> tuple[int, int, str, float] | None:
+            """Try multiple offsets of the core within a site-length window.
+
+            Returns (site_start, site_end, site_seq, best_identity) or None.
+            """
+            best = None
+            # The core can appear at any offset 0..site_len-len(core)
+            for offset in range(max(1, site_len - len(core) + 1)):
+                s = core_genome_pos - offset
+                e = s + site_len
+                s = max(0, s)
+                e = min(len(seq), e)
+                if _overlaps_existing(s, e):
+                    continue
+                candidate = seq[s:e]
+
+                # Compare against partner arms
+                if strand == "+":
+                    targets = [rc for rc, _ in r_arm_rcs]
+                else:
+                    targets = [_reverse_complement(fseq) for fseq, _ in f_arm_seqs]
+
+                for target in targets:
+                    minlen = min(len(candidate), len(target))
+                    if minlen == 0:
+                        continue
+                    matches = sum(
+                        1 for i in range(minlen)
+                        if candidate[i].upper() == target[i].upper()
+                    )
+                    identity = (matches / minlen) * 100.0
+                    if best is None or identity > best[3]:
+                        best = (s, e, candidate, identity)
+
+            return best
+
+        # Search for core motif occurrences (forward strand)
+        found_sites = []  # (genome_start, genome_end, strand, site_seq)
+        pos = 0
+        while True:
+            idx = region_seq.find(core, pos)
+            if idx == -1:
+                break
+            genome_pos = region_start + idx
+            result = _best_site_boundaries(genome_pos, "+")
+            if result is not None and result[3] >= 70.0:
+                found_sites.append((result[0], result[1], "+", result[2]))
+            pos = idx + 1
+
+        # Search reverse strand
+        pos = 0
+        while True:
+            idx = region_seq.find(core_rc, pos)
+            if idx == -1:
+                break
+            genome_pos = region_start + idx
+            result = _best_site_boundaries(genome_pos, "-")
+            if result is not None and result[3] >= 70.0:
+                found_sites.append((result[0], result[1], "-", result[2]))
+            pos = idx + 1
+
+        if not found_sites:
+            continue
+
+        # For each new site, find the best-matching existing arm to pair with.
+        # The new site becomes the F or R arm of a new IR entry.
+        template_row = cluster.iloc[0].copy()
+
+        for site_start, site_end, strand, site_seq in found_sites:
+            # Find best partner: an existing arm on the opposite strand
+            # whose reverse complement best matches this site
+            best_partner = None
+            best_identity = 0.0
+
+            for _, row in cluster.iterrows():
+                if strand == "+":
+                    # New F site — look for existing R arms to pair with
+                    partner_seq = str(row["RightIRSequence"])
+                    partner_start = int(row["RightIRStart"])
+                    partner_end = int(row["RightIRStop"])
+                else:
+                    # New R site — look for existing F arms to pair with
+                    partner_seq = str(row["LeftIRSequence"])
+                    partner_start = int(row["LeftIRStart"])
+                    partner_end = int(row["LeftIRStop"])
+
+                # Compute identity: site_seq vs RC of partner_seq
+                rc_partner = _reverse_complement(partner_seq)
+                minlen = min(len(site_seq), len(rc_partner))
+                if minlen == 0:
+                    continue
+                matches = sum(
+                    1 for i in range(minlen)
+                    if site_seq[i].upper() == rc_partner[i].upper()
+                )
+                identity = (matches / minlen) * 100.0
+                if identity > best_identity:
+                    best_identity = identity
+                    best_partner = (partner_start, partner_end, partner_seq)
+
+            if best_partner is None or best_identity < 70.0:
+                continue
+
+            partner_start, partner_end, partner_seq = best_partner
+
+            # Create new IR row
+            new_row = template_row.copy()
+            if strand == "+":
+                new_row["LeftIRStart"] = site_start
+                new_row["LeftIRStop"] = site_end
+                new_row["LeftIRSequence"] = site_seq
+                new_row["RightIRStart"] = partner_start
+                new_row["RightIRStop"] = partner_end
+                new_row["RightIRSequence"] = partner_seq
+                new_row["InvertibleSequence"] = seq[site_end:partner_start]
+            else:
+                new_row["LeftIRStart"] = partner_start
+                new_row["LeftIRStop"] = partner_end
+                new_row["LeftIRSequence"] = partner_seq
+                new_row["RightIRStart"] = site_start
+                new_row["RightIRStop"] = site_end
+                new_row["RightIRSequence"] = site_seq
+                new_row["InvertibleSequence"] = seq[partner_end:site_start]
+
+            new_row["PercentIdentity"] = round(best_identity, 2)
+            new_rows.append(new_row)
+
+            logger.info(
+                "Cluster %s: motif refinement found sfx site at %s:%d-%d (%s) "
+                "with %.1f%% identity to partner",
+                cluster_id, contig, site_start + 1, site_end, strand,
+                best_identity,
+            )
+
+    if not new_rows:
+        logger.info("Motif refinement: no additional sfx sites found")
+        return ir_df
+
+    new_df = pd.DataFrame(new_rows)
+    result = pd.concat([ir_df, new_df], ignore_index=True)
+    logger.info(
+        "Motif refinement: added %d sfx sites (%d -> %d IR entries)",
+        len(new_rows), len(ir_df), len(result),
+    )
+    return result
