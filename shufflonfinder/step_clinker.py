@@ -1,17 +1,19 @@
 """Step 8: Generate gene-organisation plots for shufflon windows.
 
-Uses dna_features_viewer to produce two-track PNG and SVG figures:
-  - Top track: directional arrows for CDS, inverted repeats, and recombinases.
-  - Bottom track: undirectional boxes for invertible segments.
+Uses dna_features_viewer to produce three-track PNG and SVG figures:
+  - Top track: inverted repeat arrows (above the annotation line).
+  - Middle track: CDS and recombinase arrows (main annotation line).
+  - Bottom track: undirectional invertible segment boxes (below).
 
-Colour scheme is consistent across all windows.
+Features are colour-coded; identification is via legend only (no inline
+labels). Colour scheme is consistent across all windows.
 """
 
 import logging
 import os
 
 import matplotlib
-matplotlib.use("Agg")  # non-interactive backend for headless rendering
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from dna_features_viewer import GraphicFeature, GraphicRecord
@@ -42,6 +44,12 @@ LEGEND_LABELS = {
     "cds_with_ir": "CDS containing IR",
     "other_cds": "CDS",
 }
+
+# Fixed legend ordering so every plot is consistent
+LEGEND_ORDER = [
+    "recombinase", "inverted_repeat", "invertible_segment",
+    "cds_with_ir", "other_cds",
+]
 
 
 # ── GFF parsing ──────────────────────────────────────────────────────────────
@@ -111,7 +119,7 @@ def _parse_window_gff(gff_path: str):
 # ── Feature classification ───────────────────────────────────────────────────
 
 def _classify_features(features: list[dict]) -> list[dict]:
-    """Assign a category and display label to each feature."""
+    """Assign a category to each feature."""
     ir_spans = [(f["start"], f["end"]) for f in features if f["type"] == "inverted_repeat"]
     hmm_spans = {(f["start"], f["end"]) for f in features if f["type"] == "hmm_hit"}
 
@@ -119,25 +127,17 @@ def _classify_features(features: list[dict]) -> list[dict]:
     for f in features:
         ftype = f["type"]
         source = f["source"]
-        attrs = f["attrs"]
 
         if ftype == "hmm_hit":
             f["category"] = "recombinase"
-            gene = attrs.get("gene", "")
-            locus = attrs.get("locus_tag", "")
-            f["label"] = f"Recombinase ({gene})" if gene else (
-                f"Recombinase ({locus})" if locus else "Recombinase"
-            )
             classified.append(f)
 
         elif ftype == "inverted_repeat":
             f["category"] = "inverted_repeat"
-            f["label"] = attrs.get("Name", attrs.get("ID", "IR"))
             classified.append(f)
 
         elif ftype == "invertible_segment":
             f["category"] = "invertible_segment"
-            f["label"] = attrs.get("Name", attrs.get("ID", "invertible_segment"))
             classified.append(f)
 
         elif ftype == "CDS":
@@ -145,24 +145,11 @@ def _classify_features(features: list[dict]) -> list[dict]:
                 continue
             if (f["start"], f["end"]) in hmm_spans:
                 continue
-
             overlaps_ir = any(
                 f["start"] <= ir_e and f["end"] >= ir_s
                 for ir_s, ir_e in ir_spans
             )
             f["category"] = "cds_with_ir" if overlaps_ir else "other_cds"
-
-            gene = attrs.get("gene", "")
-            product = attrs.get("product", "hypothetical protein")
-            locus = attrs.get("locus_tag", "")
-            if gene:
-                f["label"] = gene
-            elif product and product != "hypothetical protein":
-                f["label"] = product
-            elif locus:
-                f["label"] = locus
-            else:
-                f["label"] = "CDS"
             classified.append(f)
 
     return classified
@@ -179,115 +166,115 @@ def _strand_int(strand_str: str) -> int:
 
 
 def _build_plot(classified: list[dict], seq_length: int, title: str) -> plt.Figure:
-    """Build a two-track matplotlib figure.
+    """Build a three-track matplotlib figure.
 
-    Top track:  CDS, inverted repeats, recombinase (directional arrows).
-    Bottom track: invertible segments (undirectional boxes, no arrows).
+    Top track:    inverted repeats (directional arrows, no line).
+    Middle track: CDS + recombinase (directional arrows, with backbone line).
+    Bottom track: invertible segments (undirectional boxes, no line).
+
+    No inline labels — colour legend only.
     """
-    top_features = []
-    bottom_features = []
+    ir_features = []
+    cds_features = []
+    seg_features = []
 
     for f in classified:
         cat = f["category"]
         colour = CATEGORY_COLOURS[cat]
-        # GFF is 1-based inclusive; dna_features_viewer is 0-based
-        start = f["start"] - 1
+        start = f["start"] - 1  # GFF 1-based -> 0-based
         end = f["end"]
 
-        if cat == "invertible_segment":
-            bottom_features.append(
+        if cat == "inverted_repeat":
+            ir_features.append(
                 GraphicFeature(
-                    start=start,
-                    end=end,
-                    strand=0,           # undirectional
-                    color=colour,
-                    label=f["label"],
-                    linewidth=0.5,
-                    thickness=12,
+                    start=start, end=end,
+                    strand=_strand_int(f["strand"]),
+                    color=colour, thickness=8, linewidth=0.5,
+                )
+            )
+        elif cat == "invertible_segment":
+            seg_features.append(
+                GraphicFeature(
+                    start=start, end=end,
+                    strand=0, color=colour,
+                    thickness=10, linewidth=0.5,
                 )
             )
         else:
-            strand = _strand_int(f["strand"])
-            top_features.append(
+            cds_features.append(
                 GraphicFeature(
-                    start=start,
-                    end=end,
-                    strand=strand,
-                    color=colour,
-                    label=f["label"],
-                    linewidth=0.5,
-                    thickness=14,
+                    start=start, end=end,
+                    strand=_strand_int(f["strand"]),
+                    color=colour, thickness=14, linewidth=0.5,
                 )
             )
 
-    has_bottom = len(bottom_features) > 0
+    has_ir = len(ir_features) > 0
+    has_seg = len(seg_features) > 0
 
-    # Scale width to sequence length so short windows aren't stretched
+    # Build subplot layout depending on which tracks are populated
+    ratios = []
+    track_keys = []
+    if has_ir:
+        ratios.append(0.6)
+        track_keys.append("ir")
+    ratios.append(1.2)
+    track_keys.append("cds")
+    if has_seg:
+        ratios.append(0.6)
+        track_keys.append("seg")
+
     fig_width = max(12, min(20, seq_length / 250))
+    fig_height = 1.0 + 0.9 * len(ratios)
 
-    if has_bottom:
-        fig, (ax_top, ax_bot) = plt.subplots(
-            2, 1,
-            figsize=(fig_width, 4.5),
-            gridspec_kw={"height_ratios": [3, 1.2]},
-            sharex=True,
-        )
-    else:
-        fig, ax_top = plt.subplots(1, 1, figsize=(fig_width, 2.5))
-        ax_bot = None
-
-    # Top track
-    record_top = GraphicRecord(sequence_length=seq_length, features=top_features)
-    record_top.plot(
-        ax=ax_top,
-        with_ruler=not has_bottom,
-        draw_line=True,
-        annotate_inline=True,
-        strand_in_label_threshold=4,
+    fig, axes = plt.subplots(
+        len(ratios), 1,
+        figsize=(fig_width, fig_height),
+        gridspec_kw={"height_ratios": ratios, "hspace": 0.05},
+        sharex=True,
+        squeeze=False,
     )
-    ax_top.set_title(title, fontsize=10, loc="left", fontweight="bold")
+    axes = [ax for ax in axes.flat]
 
-    # Bottom track
-    if has_bottom:
-        record_bot = GraphicRecord(sequence_length=seq_length, features=bottom_features)
-        record_bot.plot(
-            ax=ax_bot,
-            with_ruler=True,
-            draw_line=True,
-            annotate_inline=True,
-            strand_in_label_threshold=4,
-        )
+    ax_map = dict(zip(track_keys, axes))
+
+    # IR track (above CDS)
+    if "ir" in ax_map:
+        rec = GraphicRecord(sequence_length=seq_length, features=ir_features)
+        rec.plot(ax=ax_map["ir"], with_ruler=False, draw_line=False, annotate_inline=False)
+
+    # CDS track (main annotation line)
+    rec = GraphicRecord(sequence_length=seq_length, features=cds_features)
+    rec.plot(ax=ax_map["cds"], with_ruler=not has_seg, draw_line=True, annotate_inline=False)
+    ax_map["cds"].set_title(title, fontsize=10, loc="left", fontweight="bold")
+
+    # Segment track (below CDS)
+    if "seg" in ax_map:
+        rec = GraphicRecord(sequence_length=seq_length, features=seg_features)
+        rec.plot(ax=ax_map["seg"], with_ruler=True, draw_line=False, annotate_inline=False)
 
     # Legend
     categories_present = {f["category"] for f in classified}
-    # Fixed ordering for consistency
-    legend_order = [
-        "recombinase", "inverted_repeat", "invertible_segment",
-        "cds_with_ir", "other_cds",
+    handles = [
+        mpatches.Patch(
+            facecolor=CATEGORY_COLOURS[cat],
+            edgecolor="black", linewidth=0.5,
+            label=LEGEND_LABELS[cat],
+        )
+        for cat in LEGEND_ORDER if cat in categories_present
     ]
-    handles = []
-    for cat in legend_order:
-        if cat in categories_present:
-            handles.append(
-                mpatches.Patch(
-                    facecolor=CATEGORY_COLOURS[cat],
-                    edgecolor="black",
-                    linewidth=0.5,
-                    label=LEGEND_LABELS[cat],
-                )
-            )
 
-    legend_ax = ax_bot if has_bottom else ax_top
-    legend_ax.legend(
+    bottom_ax = axes[-1]
+    bottom_ax.legend(
         handles=handles,
         loc="upper center",
-        bbox_to_anchor=(0.5, -0.4),
+        bbox_to_anchor=(0.5, -0.5),
         ncol=len(handles),
         fontsize=8,
         frameon=False,
     )
 
-    plt.tight_layout()
+    fig.subplots_adjust(hspace=0.05)
     return fig
 
 
@@ -316,10 +303,7 @@ def generate_shufflon_plot(gff_path: str, output_dir: str) -> list[str]:
         logger.warning("No classifiable features in %s, skipping plot", gff_path)
         return []
 
-    # Use first (typically only) sequence's length
     seq_length = len(next(iter(sequences.values())))
-
-    # Build a short title from the basename
     title = basename.replace("_contig_", " — ").replace("_window_", " window ")
 
     fig = _build_plot(classified, seq_length, title)
@@ -338,11 +322,12 @@ def generate_shufflon_plot(gff_path: str, output_dir: str) -> list[str]:
 def generate_shufflon_plots(window_dir: str, plots_dir: str) -> list[str]:
     """Generate plots for all window GFFs in a directory tree.
 
-    Walks window_dir for .gff files and writes PNG/SVG plots into a
-    mirrored subdirectory structure under plots_dir.
+    Walks window_dir for .gff files and writes PNG/SVG plots into
+    per-sample subdirectories under plots_dir, mirroring the
+    subdirectory structure from window_dir.
 
     Args:
-        window_dir: Top-level 07_shufflon_windows directory containing GFFs.
+        window_dir: Top-level GFF directory (e.g. 07_shufflon_windows/gffs/).
         plots_dir: Top-level output directory for plot files.
 
     Returns:
