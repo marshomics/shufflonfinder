@@ -1,6 +1,6 @@
 # shufflonfinder
 
-Annotate shufflon structures in bacterial genomes. Searches predicted proteins against a library of HMM profiles targeting shufflon-associated recombinases (e.g. Rci), extracts flanking DNA around each hit, detects inverted repeats in those flanking regions using EMBOSS einverted, applies motif-based refinement to recover sfx recognition sites missed by pairwise alignment, filters for dense IR clusters, and produces merged GFF annotations with windowed output and Clinker visualisations for each candidate shufflon locus.
+Annotate shufflon structures in bacterial genomes. Searches predicted proteins against a library of HMM profiles targeting shufflon-associated recombinases (e.g. Rci), extracts flanking DNA around each hit, detects inverted repeats in those flanking regions using EMBOSS einverted, applies motif-based refinement to recover sfx recognition sites missed by pairwise alignment, filters for dense IR clusters, and produces merged GFF annotations with windowed output and gene-organisation plots for each candidate shufflon locus.
 
 
 ## How it works
@@ -23,7 +23,7 @@ The pipeline runs eight steps in sequence:
 
 8. **Window extraction** identifies CDS features overlapping each shufflon candidate cluster, finds invertible DNA segments between consecutive IR arms, and writes self-contained GFF+FASTA files for each candidate shufflon region. Each window GFF carries four annotation tracks: `inverted_repeat` features (from einverted and motif search, named `inverted_repeat_NN_FOR`/`inverted_repeat_NN_REV`), `hmm_hit` features (the recombinase gene with HMM profile info), `CDS` features (overlapping Prokka genes), and `invertible_segment` features (the DNA between consecutive IR arms, corresponding to shufflon cassettes).
 
-9. **Clinker visualisation** generates an interactive HTML gene-cluster comparison plot for each window GFF using [Clinker](https://github.com/gamcil/clinker). Features are colour-coded by category: recombinases (red), inverted repeats (steel blue), invertible segments (orange), CDS containing inverted repeats (teal), and other CDS (grey). Clinker outputs are written to a dedicated `clinker/` subdirectory within `07_shufflon_windows/`.
+9. **Plot generation** produces PNG and SVG gene-organisation figures for each window GFF using [dna_features_viewer](https://github.com/Edinburgh-Genome-Foundry/DnaFeaturesViewer). Each plot has two tracks: a top track with directional arrows for CDS, inverted repeats, and the recombinase, and a bottom track with undirectional boxes for invertible segments. Features are colour-coded by category: recombinases (red), inverted repeats (steel blue), invertible segments (orange), CDS containing inverted repeats (teal), and other CDS (grey). Plot files are written to a `plots/` subdirectory within `07_shufflon_windows/`.
 
 
 ## Prerequisites
@@ -41,7 +41,8 @@ Python libraries (installed via pip):
 - Python >= 3.9
 - Biopython >= 1.80
 - pandas >= 1.5
-- [clinker](https://github.com/gamcil/clinker) >= 0.0.28
+- [dna_features_viewer](https://github.com/Edinburgh-Genome-Foundry/DnaFeaturesViewer) >= 3.1
+- matplotlib >= 3.5
 
 
 ## Installation
@@ -63,7 +64,7 @@ shufflonfinder --help
 prokka --version
 hmmsearch -h | head -1
 einverted --help
-clinker --version
+python -c "import dna_features_viewer; print(dna_features_viewer.__version__)"
 ```
 
 The 41 HMM profiles ship with the package in `shufflonfinder/hmms/`. No additional downloads are needed.
@@ -178,8 +179,8 @@ results/
 └── 07_shufflon_windows/
     ├── shufflon_windows_summary.tsv  # Combined summary table (all samples)
     ├── <sample_id>/                  # Per-window GFF+FASTA files
-    └── clinker/                      # Clinker visualisations
-        └── <sample_id>/              # Per-window .html plots, .gbk, colour/function CSVs
+    └── plots/                        # Gene-organisation figures
+        └── <sample_id>/              # Per-window .png and .svg plots
 ```
 
 ### Key output files
@@ -196,7 +197,7 @@ results/
 
 `07_shufflon_windows/<sample_id>/` contains one GFF+FASTA file per candidate shufflon region. Each GFF has four annotation tracks: `inverted_repeat` features (from einverted or motif_search, named `inverted_repeat_NN_FOR`/`inverted_repeat_NN_REV`), `hmm_hit` features (the recombinase gene), `CDS` features (overlapping Prokka genes), and `invertible_segment` features (the DNA between consecutive IR arms).
 
-`07_shufflon_windows/clinker/<sample_id>/` contains Clinker outputs for each window: an interactive HTML plot, a GenBank file (.gbk) used as Clinker input, and CSV files mapping genes to functional categories and colours.
+`07_shufflon_windows/plots/<sample_id>/` contains PNG and SVG gene-organisation figures for each window. The top track shows directional arrows for CDS, inverted repeats, and recombinases; the bottom track shows undirectional boxes for invertible segments. All features are colour-coded consistently across windows.
 
 
 ## HMM profiles
