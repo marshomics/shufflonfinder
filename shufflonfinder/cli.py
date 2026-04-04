@@ -122,8 +122,10 @@ def parse_args(argv=None):
         help="Window size (bp) for clustering nearby IRs (default: 3000).",
     )
     p.add_argument(
-        "--min-ir-arm-length", type=int, default=10,
-        help="Minimum IR arm length in bp to keep (default: 10).",
+        "--min-ir-arm-length", type=int, default=15,
+        help="Minimum IR arm length in bp to keep. Shufflon sfx "
+             "recognition sites are typically 19 bp; shorter arms are "
+             "usually coincidental matches (default: 15).",
     )
     p.add_argument(
         "--max-ir-arm-length", type=int, default=35,
@@ -132,8 +134,11 @@ def parse_args(argv=None):
              "transposon or IS-element IRs (default: 35).",
     )
     p.add_argument(
-        "--min-ir-identity", type=float, default=70.0,
-        help="Minimum percent identity between IR arms to keep (default: 70.0).",
+        "--min-ir-identity", type=float, default=90.0,
+        help="Minimum percent identity between IR arms to keep. "
+             "Shufflon sfx sites are highly conserved (typically "
+             "≥95%% identity); lower-identity matches are usually "
+             "coincidental (default: 90.0).",
     )
     p.add_argument(
         "--min-ir-pairs", type=int, default=3,
@@ -149,11 +154,11 @@ def parse_args(argv=None):
              "(default: 1000).",
     )
     p.add_argument(
-        "--min-ir-density", type=float, default=2.0,
+        "--min-ir-density", type=float, default=1.0,
         help="Minimum IR pairs per kilobase within a cluster to qualify "
-             "as a shufflon candidate. Shufflons pack multiple "
-             "recognition sites into a few kilobases; sparse repeat "
-             "regions are filtered out (default: 2.0).",
+             "as a shufflon candidate. einverted typically detects 3-5 "
+             "of the pairwise sfx combinations in a shufflon spanning "
+             "~2 kb, giving densities of 1.5-2.5 pairs/kb (default: 1.0).",
     )
     p.add_argument(
         "--skip-prokka", action="store_true",
