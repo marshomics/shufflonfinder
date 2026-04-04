@@ -1,4 +1,4 @@
-# shufflonfinder
+# ShufflonFinder
 
 Annotate shufflon structures in bacterial genomes. Searches predicted proteins against a library of HMM profiles targeting shufflon-associated recombinases (e.g. Rci), extracts flanking DNA around each hit, detects inverted repeats in those flanking regions using EMBOSS einverted, applies motif-based refinement to recover sfx recognition sites missed by pairwise alignment, filters for dense IR clusters, and produces merged GFF annotations with windowed output and gene-organisation plots for each candidate shufflon locus.
 
