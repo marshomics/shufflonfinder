@@ -43,12 +43,14 @@ from .step_hmmsearch import (
 from .step_flanking import (
     extract_flanking_regions,
     flanking_regions_to_tsv,
+    parse_fasta_from_gff,
 )
 from .step_phava import (
     detect_inverted_repeats,
     combine_ir_tables,
     filter_ir_table,
     filter_shufflon_candidates,
+    refine_sfx_sites,
 )
 from .step_gff import (
     hmm_hits_to_gff,
@@ -129,11 +131,11 @@ def parse_args(argv=None):
              "(default: 13).",
     )
     p.add_argument(
-        "--max-ir-arm-length", type=int, default=50,
-        help="Maximum IR arm length in bp to keep. Individual sfx sites "
-             "are ~19 bp, but einverted can align across two abutting "
-             "sites producing arms up to ~40 bp; 50 accommodates this "
-             "while excluding transposon/IS-element IRs (default: 50).",
+        "--max-ir-arm-length", type=int, default=35,
+        help="Maximum IR arm length in bp to keep. Shufflon sfx recognition "
+             "sites are typically 19 bp; longer arms usually come from "
+             "transposon or IS-element IRs, or from einverted extending "
+             "across two abutting sites (default: 35).",
     )
     p.add_argument(
         "--min-ir-identity", type=float, default=85.0,
@@ -347,6 +349,17 @@ def main(argv=None):
         min_ir_density=args.min_ir_density,
         window_size=args.window_size,
     )
+
+    # Motif-based refinement: detect sfx sites missed by einverted
+    # Collect genome sequences from all samples for motif searching
+    all_sequences = {}
+    for sample in samples:
+        if sample.gff_path and os.path.isfile(sample.gff_path):
+            seqs = parse_fasta_from_gff(sample.gff_path)
+            all_sequences.update(seqs)
+    if all_sequences:
+        ir_df = refine_sfx_sites(ir_df, all_sequences)
+
     ir_shufflon_path = os.path.join(dirs["shufflon"], "IRs_shufflon_candidates.tsv")
     ir_df.to_csv(ir_shufflon_path, sep="\t", index=False)
     logger.info("Shufflon candidate IRs: %d records -> %s", len(ir_df), ir_shufflon_path)
