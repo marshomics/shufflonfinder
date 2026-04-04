@@ -65,7 +65,8 @@ def hmm_hits_to_gff(
 
         cds_map = parse_cds_from_gff(sample.gff_path)
 
-        gff_path = os.path.join(output_dir, f"{sample_id}_hmm_hits.gff")
+        sample_dir = ensure_dir(os.path.join(output_dir, sample_id))
+        gff_path = os.path.join(sample_dir, f"{sample_id}_hmm_hits.gff")
         written = 0
         seen = set()
         with open(gff_path, "w") as fh:
@@ -133,7 +134,8 @@ def ir_to_gff(ir_df: pd.DataFrame, output_dir: str) -> dict[str, str]:
 
     grouped = ir_df.groupby("sample_id")
     for sample_id, group in grouped:
-        gff_path = os.path.join(output_dir, f"{sample_id}_ir.gff")
+        sample_dir = ensure_dir(os.path.join(output_dir, sample_id))
+        gff_path = os.path.join(sample_dir, f"{sample_id}_ir.gff")
         with open(gff_path, "w", newline="") as fh:
             writer = csv.writer(fh, delimiter="\t")
             for counter, (_, row) in enumerate(group.iterrows(), start=1):
@@ -664,13 +666,8 @@ def extract_shufflon_windows(
                 f"{input_prefix}_contig_{contig_id}_window_{wnum}.gff",
             )
 
-            # Find invertible cassettes from IR pairs and their ORFs
+            # Find invertible cassettes from IR pairs
             cassettes = _find_invertible_cassettes(ir_group)
-            segment_orfs = []  # (seg_index, start, end, strand)
-            for si, (seg_s, seg_e) in enumerate(cassettes):
-                orfs = _longest_orf_per_strand(seq, seg_s, seg_e, min_aa=20)
-                for orf_s, orf_e, orf_strand in orfs:
-                    segment_orfs.append((si, orf_s, orf_e, orf_strand))
 
             with open(out_path, "w") as fh:
                 fh.write("##gff-version 3\n")
@@ -710,36 +707,6 @@ def extract_shufflon_windows(
                         f"{local_s}\t{local_e}\t.\t.\t.\t"
                         f"ID=invertible_segment_{si:03d};"
                         f"Name=Invertible segment {si} ({seg_len} bp)\n"
-                    )
-
-                # Track 5: predicted cassette CDS within invertible segments
-                # One per segment (the longest ORF), skipping any already
-                # covered by a Prokka CDS annotation.
-                prokka_spans = [(cds.start, cds.end) for cds in intersecting_cds]
-
-                orf_counter = 0
-                for seg_idx, orf_s, orf_e, orf_strand in segment_orfs:
-                    # Skip if a Prokka CDS substantially overlaps this ORF
-                    covered = any(
-                        cs <= orf_s and ce >= orf_e
-                        for cs, ce in prokka_spans
-                    )
-                    if covered:
-                        continue
-                    orf_counter += 1
-                    local_s = orf_s - win_start + 1
-                    local_e = orf_e - win_start
-                    orf_len_aa = (orf_e - orf_s) // 3
-                    fh.write(
-                        f"{seq_id}\tshufflonfinder\tCDS\t"
-                        f"{local_s}\t{local_e}\t.\t{orf_strand}\t0\t"
-                        f"ID=shufflon_cassette_{orf_counter:03d};"
-                        f"Name=Shufflon cassette {orf_counter} "
-                        f"({orf_len_aa} aa);"
-                        f"product=putative shufflon cassette protein;"
-                        f"inference=ab initio prediction:shufflonfinder;"
-                        f"note=partial;truncated C-terminal segment "
-                        f"in invertible segment {seg_idx + 1}\n"
                     )
 
                 fh.write("##FASTA\n")
