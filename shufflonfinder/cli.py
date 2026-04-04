@@ -25,7 +25,9 @@ import argparse
 import importlib.resources
 import logging
 import os
+import shutil
 import sys
+import tempfile
 
 import pandas as pd
 
@@ -250,9 +252,6 @@ def main(argv=None):
             "plots":        ensure_dir(os.path.join(root, "07_shufflon_windows", "plots")),
         }
 
-    # Shared HMM profiles directory (prepared once, used by all samples)
-    hmm_profiles_dir = ensure_dir(os.path.join(outdir, "hmm_profiles"))
-
     # Build dirs for each sample up front
     sdirs = {s.sample_id: sample_dirs(s.sample_id) for s in samples}
 
@@ -280,7 +279,9 @@ def main(argv=None):
     logger.info("STEP 2: HMM search (all profiles)")
     logger.info("=" * 60)
 
-    profiles = prepare_hmm_profiles(hmm_dir, hmm_profiles_dir)
+    # Prepared profiles go into a temp directory (cleaned up on exit)
+    _hmm_tmpdir = tempfile.mkdtemp(prefix="shufflonfinder_hmm_")
+    profiles = prepare_hmm_profiles(hmm_dir, _hmm_tmpdir)
     logger.info("Searching %d HMM profiles against %d samples", len(profiles), len(samples))
 
     all_tblout_files = []
@@ -484,6 +485,9 @@ def main(argv=None):
     logger.info("Inverted repeats:      %d", len(ir_df))
     logger.info("Shufflon windows:      %d", len(all_windows))
     logger.info("Results in:            %s", outdir)
+
+    # Clean up temporary HMM profile directory
+    shutil.rmtree(_hmm_tmpdir, ignore_errors=True)
 
 
 if __name__ == "__main__":
