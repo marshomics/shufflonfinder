@@ -230,6 +230,7 @@ def main(argv=None):
         "gff_ir":       ensure_dir(os.path.join(outdir, "06_gff", "ir")),
         "gff_merged":   ensure_dir(os.path.join(outdir, "06_gff", "merged")),
         "windows":      ensure_dir(os.path.join(outdir, "07_shufflon_windows")),
+        "clinker":      ensure_dir(os.path.join(outdir, "07_shufflon_windows", "clinker")),
     }
 
     # ==================================================================
@@ -422,7 +423,7 @@ def main(argv=None):
     logger.info("STEP 8: Generating Clinker plots")
     logger.info("=" * 60)
 
-    clinker_plots = generate_clinker_plots(dirs["windows"])
+    clinker_plots = generate_clinker_plots(dirs["windows"], dirs["clinker"])
     logger.info("Generated %d Clinker plot(s)", len(clinker_plots))
 
     # ==================================================================
