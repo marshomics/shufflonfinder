@@ -24,14 +24,27 @@ logger = logging.getLogger("shufflonfinder")
 
 # ── Colour scheme ────────────────────────────────────────────────────────────
 COLOUR_RECOMBINASE = "#E63946"        # red
-COLOUR_INVERTED_REPEAT = "#457B9D"    # steel blue
 COLOUR_INVERTIBLE_SEGMENT = "#F4A261" # sandy orange
 COLOUR_CDS_WITH_IR = "#2A9D8F"       # teal
 COLOUR_OTHER_CDS = "#CCCCCC"         # light grey
 
+# Distinct palette for IR pairs — each pair gets its own colour.
+# Wraps if there are more pairs than palette entries.
+IR_PAIR_PALETTE = [
+    "#457B9D",  # steel blue
+    "#8338EC",  # violet
+    "#06D6A0",  # mint
+    "#FF6B6B",  # coral
+    "#FFD166",  # gold
+    "#118AB2",  # cerulean
+    "#EF476F",  # pink
+    "#073B4C",  # dark teal
+    "#B5179E",  # magenta
+    "#7209B7",  # purple
+]
+
 CATEGORY_COLOURS = {
     "recombinase": COLOUR_RECOMBINASE,
-    "inverted_repeat": COLOUR_INVERTED_REPEAT,
     "invertible_segment": COLOUR_INVERTIBLE_SEGMENT,
     "cds_with_ir": COLOUR_CDS_WITH_IR,
     "other_cds": COLOUR_OTHER_CDS,
@@ -157,6 +170,29 @@ def _classify_features(features: list[dict]) -> list[dict]:
 
 # ── Plot generation ──────────────────────────────────────────────────────────
 
+import re
+
+_IR_PAIR_RE = re.compile(r"inverted_repeat_(\d+)")
+
+
+def _extract_ir_pair_number(feature: dict) -> int:
+    """Extract the pair number from an IR feature's ID attribute.
+
+    Parses names like ``inverted_repeat_01_FOR`` / ``inverted_repeat_03_REV``
+    and returns the integer pair index (1, 3, …).  Returns 0 when the name
+    doesn't match the expected pattern.
+    """
+    name = feature.get("attrs", {}).get("ID", "") or feature.get("attrs", {}).get("Name", "")
+    m = _IR_PAIR_RE.search(name)
+    return int(m.group(1)) if m else 0
+
+
+def _ir_pair_colour(pair_number: int) -> str:
+    """Return a deterministic colour for the given IR pair number."""
+    idx = (pair_number - 1) % len(IR_PAIR_PALETTE) if pair_number > 0 else 0
+    return IR_PAIR_PALETTE[idx]
+
+
 def _strand_int(strand_str: str) -> int:
     if strand_str == "+":
         return +1
@@ -168,7 +204,8 @@ def _strand_int(strand_str: str) -> int:
 def _build_plot(classified: list[dict], seq_length: int, title: str) -> plt.Figure:
     """Build a three-track matplotlib figure.
 
-    Top track:    inverted repeats (directional arrows, no line).
+    Top track:    inverted repeats — each pair in a distinct colour, all on
+                  one line (no stacking even when features overlap).
     Middle track: CDS + recombinase (directional arrows, with backbone line).
     Bottom track: invertible segments (undirectional boxes, no line).
 
@@ -177,14 +214,17 @@ def _build_plot(classified: list[dict], seq_length: int, title: str) -> plt.Figu
     ir_features = []
     cds_features = []
     seg_features = []
+    ir_pair_numbers = set()
 
     for f in classified:
         cat = f["category"]
-        colour = CATEGORY_COLOURS[cat]
         start = f["start"] - 1  # GFF 1-based -> 0-based
         end = f["end"]
 
         if cat == "inverted_repeat":
+            pair_num = _extract_ir_pair_number(f)
+            ir_pair_numbers.add(pair_num)
+            colour = _ir_pair_colour(pair_num)
             ir_features.append(
                 GraphicFeature(
                     start=start, end=end,
@@ -196,7 +236,7 @@ def _build_plot(classified: list[dict], seq_length: int, title: str) -> plt.Figu
             seg_features.append(
                 GraphicFeature(
                     start=start, end=end,
-                    strand=0, color=colour,
+                    strand=0, color=CATEGORY_COLOURS[cat],
                     thickness=10, linewidth=0.5,
                 )
             )
@@ -205,43 +245,46 @@ def _build_plot(classified: list[dict], seq_length: int, title: str) -> plt.Figu
                 GraphicFeature(
                     start=start, end=end,
                     strand=_strand_int(f["strand"]),
-                    color=colour, thickness=14, linewidth=0.5,
+                    color=CATEGORY_COLOURS[cat],
+                    thickness=14, linewidth=0.5,
                 )
             )
 
     has_ir = len(ir_features) > 0
     has_seg = len(seg_features) > 0
 
-    # Build subplot layout depending on which tracks are populated
+    # Build subplot layout — tight ratios to keep IR track close to CDS
     ratios = []
     track_keys = []
     if has_ir:
-        ratios.append(0.6)
+        ratios.append(0.35)
         track_keys.append("ir")
-    ratios.append(1.2)
+    ratios.append(1.0)
     track_keys.append("cds")
     if has_seg:
-        ratios.append(0.6)
+        ratios.append(0.35)
         track_keys.append("seg")
 
     fig_width = max(12, min(20, seq_length / 250))
-    fig_height = 1.0 + 0.9 * len(ratios)
+    fig_height = 0.8 + 0.7 * len(ratios)
 
     fig, axes = plt.subplots(
         len(ratios), 1,
         figsize=(fig_width, fig_height),
-        gridspec_kw={"height_ratios": ratios, "hspace": 0.05},
+        gridspec_kw={"height_ratios": ratios, "hspace": 0.02},
         sharex=True,
         squeeze=False,
     )
     axes = [ax for ax in axes.flat]
-
     ax_map = dict(zip(track_keys, axes))
 
-    # IR track (above CDS)
+    # IR track (above CDS) — single row, no stacking
     if "ir" in ax_map:
         rec = GraphicRecord(sequence_length=seq_length, features=ir_features)
-        rec.plot(ax=ax_map["ir"], with_ruler=False, draw_line=False, annotate_inline=False)
+        ax_ir = ax_map["ir"]
+        rec.plot(ax=ax_ir, with_ruler=False, draw_line=False, annotate_inline=False)
+        # Force all features onto the same y-row (collapse stacking)
+        ax_ir.set_ylim(-1, 1)
 
     # CDS track (main annotation line)
     rec = GraphicRecord(sequence_length=seq_length, features=cds_features)
@@ -253,28 +296,43 @@ def _build_plot(classified: list[dict], seq_length: int, title: str) -> plt.Figu
         rec = GraphicRecord(sequence_length=seq_length, features=seg_features)
         rec.plot(ax=ax_map["seg"], with_ruler=True, draw_line=False, annotate_inline=False)
 
-    # Legend
-    categories_present = {f["category"] for f in classified}
-    handles = [
-        mpatches.Patch(
-            facecolor=CATEGORY_COLOURS[cat],
-            edgecolor="black", linewidth=0.5,
-            label=LEGEND_LABELS[cat],
-        )
-        for cat in LEGEND_ORDER if cat in categories_present
-    ]
+    # Legend — CDS categories + per-pair IR colours
+    handles = []
+    for cat in LEGEND_ORDER:
+        if cat == "inverted_repeat":
+            if not has_ir:
+                continue
+            for pair_num in sorted(ir_pair_numbers):
+                label = f"IR pair {pair_num:02d}" if pair_num > 0 else "IR (unknown pair)"
+                handles.append(
+                    mpatches.Patch(
+                        facecolor=_ir_pair_colour(pair_num),
+                        edgecolor="black", linewidth=0.5,
+                        label=label,
+                    )
+                )
+        else:
+            present = any(f["category"] == cat for f in classified)
+            if present:
+                handles.append(
+                    mpatches.Patch(
+                        facecolor=CATEGORY_COLOURS[cat],
+                        edgecolor="black", linewidth=0.5,
+                        label=LEGEND_LABELS[cat],
+                    )
+                )
 
     bottom_ax = axes[-1]
     bottom_ax.legend(
         handles=handles,
         loc="upper center",
-        bbox_to_anchor=(0.5, -0.5),
-        ncol=len(handles),
+        bbox_to_anchor=(0.5, -0.4),
+        ncol=min(len(handles), 6),
         fontsize=8,
         frameon=False,
     )
 
-    fig.subplots_adjust(hspace=0.05)
+    fig.subplots_adjust(hspace=0.02)
     return fig
 
 
@@ -320,27 +378,25 @@ def generate_shufflon_plot(gff_path: str, output_dir: str) -> list[str]:
 
 
 def generate_shufflon_plots(window_dir: str, plots_dir: str) -> list[str]:
-    """Generate plots for all window GFFs in a directory tree.
+    """Generate plots for all window GFFs in a directory.
 
-    Walks window_dir for .gff files and writes PNG/SVG plots into
-    per-sample subdirectories under plots_dir, mirroring the
-    subdirectory structure from window_dir.
+    Scans window_dir for .gff files and writes PNG/SVG plots directly
+    into plots_dir (flat, no subdirectories).
 
     Args:
-        window_dir: Top-level GFF directory (e.g. 07_shufflon_windows/gffs/).
-        plots_dir: Top-level output directory for plot files.
+        window_dir: Directory containing window GFF files.
+        plots_dir: Output directory for plot files.
 
     Returns:
         List of paths to all generated plot files.
     """
     all_outputs = []
-    for root, _dirs, files in os.walk(window_dir):
-        for fname in sorted(files):
-            if not fname.endswith(".gff"):
-                continue
-            gff_path = os.path.join(root, fname)
-            rel = os.path.relpath(root, window_dir)
-            out_subdir = os.path.join(plots_dir, rel)
-            outputs = generate_shufflon_plot(gff_path, out_subdir)
-            all_outputs.extend(outputs)
+    if not os.path.isdir(window_dir):
+        return all_outputs
+    for fname in sorted(os.listdir(window_dir)):
+        if not fname.endswith(".gff"):
+            continue
+        gff_path = os.path.join(window_dir, fname)
+        outputs = generate_shufflon_plot(gff_path, plots_dir)
+        all_outputs.extend(outputs)
     return all_outputs
