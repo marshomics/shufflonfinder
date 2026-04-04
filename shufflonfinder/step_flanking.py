@@ -235,7 +235,8 @@ def extract_flanking_regions(
         return "", []
 
     regions = []
-    fasta_path = os.path.join(outdir, f"{sample.sample_id}_flanking.fasta")
+    sample_dir = ensure_dir(os.path.join(outdir, sample.sample_id))
+    fasta_path = os.path.join(sample_dir, f"{sample.sample_id}_flanking.fasta")
 
     with open(fasta_path, "w") as fh:
         for _, hit in deduped.iterrows():
