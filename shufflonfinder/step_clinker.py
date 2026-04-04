@@ -346,14 +346,16 @@ def generate_clinker_plot(gff_path: str, output_dir: str) -> str | None:
         return None
 
 
-def generate_clinker_plots(window_dir: str) -> list[str]:
+def generate_clinker_plots(window_dir: str, clinker_dir: str) -> list[str]:
     """Generate Clinker plots for all window GFFs in a directory tree.
 
-    Walks the window_dir looking for .gff files and generates a
-    corresponding .html plot alongside each one.
+    Walks the window_dir looking for .gff files and writes all clinker
+    outputs (GenBank, CSVs, HTML plots) into a mirrored subdirectory
+    structure under clinker_dir.
 
     Args:
-        window_dir: Top-level 07_shufflon_windows directory.
+        window_dir: Top-level 07_shufflon_windows directory containing GFFs.
+        clinker_dir: Top-level output directory for clinker results.
 
     Returns:
         List of paths to generated HTML plots.
@@ -363,11 +365,11 @@ def generate_clinker_plots(window_dir: str) -> list[str]:
         for fname in sorted(files):
             if not fname.endswith(".gff"):
                 continue
-            # Skip summary files
-            if fname.endswith("_summary.tsv"):
-                continue
             gff_path = os.path.join(root, fname)
-            plot = generate_clinker_plot(gff_path, root)
+            # Mirror the subdirectory structure from window_dir into clinker_dir
+            rel = os.path.relpath(root, window_dir)
+            out_subdir = os.path.join(clinker_dir, rel)
+            plot = generate_clinker_plot(gff_path, out_subdir)
             if plot:
                 plots.append(plot)
     return plots
