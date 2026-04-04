@@ -451,6 +451,7 @@ def main(argv=None):
             sd["window_gffs"],
             sample_id=sample.sample_id,
             window_size=args.window_size,
+            min_ir_pairs=args.min_ir_pairs,
         )
         all_windows.extend(windows)
 
