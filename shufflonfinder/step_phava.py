@@ -626,6 +626,50 @@ def _cluster_density(ir_df: pd.DataFrame, cluster_idx: list[int]) -> float:
     return len(cluster_idx) / span_kb
 
 
+def _remove_nested_pairs(
+    ir_df: pd.DataFrame,
+    cluster_idx: list[int],
+) -> list[int]:
+    """Remove IR pairs whose span is entirely contained within another pair.
+
+    An IR pair's span runs from its leftmost arm coordinate to its
+    rightmost arm coordinate.  If pair B's span falls entirely within
+    pair A's span, B is considered nested and is removed.  When two
+    pairs have identical spans, neither is treated as nested (they are
+    kept as potential distinct sfx combinations at the same locus).
+
+    Args:
+        ir_df: Full IR DataFrame (indexed so .loc works).
+        cluster_idx: Row indices belonging to one cluster.
+
+    Returns:
+        Filtered list of row indices with nested pairs removed.
+    """
+    if len(cluster_idx) <= 1:
+        return cluster_idx
+
+    spans = {idx: _ir_span(ir_df.loc[idx]) for idx in cluster_idx}
+    nested = set()
+
+    for idx_b in cluster_idx:
+        b_min, b_max = spans[idx_b]
+        for idx_a in cluster_idx:
+            if idx_a == idx_b:
+                continue
+            a_min, a_max = spans[idx_a]
+            # B is strictly nested inside A (not identical spans)
+            if a_min <= b_min and a_max >= b_max and (a_min, a_max) != (b_min, b_max):
+                nested.add(idx_b)
+                break
+
+    if nested:
+        logger.debug(
+            "Removed %d nested IR pair(s) from cluster of %d",
+            len(nested), len(cluster_idx),
+        )
+    return [idx for idx in cluster_idx if idx not in nested]
+
+
 def filter_shufflon_candidates(
     ir_df: pd.DataFrame,
     samples: list[Sample],
@@ -636,10 +680,11 @@ def filter_shufflon_candidates(
 ) -> pd.DataFrame:
     """Filter IRs to keep only dense, shufflon-like clusters.
 
-    A valid shufflon candidate must have:
-      1. At least ``min_ir_pairs`` IR pairs within a cluster (clustered at
-         ``cluster_distance`` bp gaps).
-      2. A density of at least ``min_ir_density`` IR pairs per kilobase.
+    For each cluster the pipeline:
+      1. Removes nested IR pairs (pairs whose span falls entirely
+         within another pair's span).
+      2. Requires at least ``min_ir_pairs`` remaining pairs.
+      3. Requires a density of at least ``min_ir_density`` pairs/kb.
 
     Every IR in the input already comes from the flanking region of a
     recombinase HMM hit (within ±flank_bp of the gene), so proximity to a
@@ -672,6 +717,7 @@ def filter_shufflon_candidates(
         return ir_df
 
     before = len(ir_df)
+    n_nested_total = 0
     keep_indices = []
     cluster_labels = {}
 
@@ -679,7 +725,12 @@ def filter_shufflon_candidates(
         clusters = _cluster_ir_rows(sample_irs, cluster_distance)
 
         for ci, cluster_idx in enumerate(clusters):
-            # --- count check ---
+            # --- remove nested pairs first ---
+            before_nesting = len(cluster_idx)
+            cluster_idx = _remove_nested_pairs(ir_df, cluster_idx)
+            n_nested_total += before_nesting - len(cluster_idx)
+
+            # --- count check (applied after nesting removal) ---
             if len(cluster_idx) < min_ir_pairs:
                 continue
 
@@ -700,6 +751,9 @@ def filter_shufflon_candidates(
                 keep_indices.append(idx)
                 cluster_labels[idx] = cid
 
+    if n_nested_total:
+        logger.info("Removed %d nested IR pair(s) across all clusters", n_nested_total)
+
     if not keep_indices:
         logger.warning("No IR clusters met the shufflon candidate criteria")
         return pd.DataFrame(columns=list(ir_df.columns) + ["cluster_id"])
@@ -711,8 +765,9 @@ def filter_shufflon_candidates(
     n_clusters = result["cluster_id"].nunique()
     logger.info(
         "Shufflon candidate filter: %d -> %d IRs in %d cluster(s) "
-        "(removed %d IRs from sparse regions)",
+        "(removed %d IRs: %d nested + %d from sparse/small regions)",
         before, len(result), n_clusters, removed,
+        n_nested_total, removed - n_nested_total,
     )
     return result
 
