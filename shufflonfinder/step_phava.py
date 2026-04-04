@@ -476,6 +476,66 @@ def filter_ir_table(
     return ir_df
 
 
+def filter_irs_in_hmm_hits(
+    ir_df: pd.DataFrame,
+    flanking_regions: list[FlankingRegion],
+) -> pd.DataFrame:
+    """Remove IRs where either arm falls inside an HMM-hit CDS.
+
+    sfx recognition sites sit between invertible gene cassettes, not
+    inside the recombinase gene itself.  einverted sometimes reports
+    palindromic structure within the recombinase coding sequence as
+    an inverted repeat; these are false positives for shufflon
+    annotation purposes.
+
+    An IR is removed if *either* arm (left or right) is fully
+    contained within the CDS coordinates of any HMM hit on the same
+    sample and contig.
+
+    Args:
+        ir_df: IR DataFrame with genome-absolute coordinates (must
+            contain ``sample_id``, ``IR_Chr``, ``LeftIRStart``,
+            ``LeftIRStop``, ``RightIRStart``, ``RightIRStop``).
+        flanking_regions: List of FlankingRegion objects from step 3,
+            each carrying ``sample_id``, ``contig``, ``cds_start``,
+            ``cds_end`` for the HMM-hit CDS.
+
+    Returns:
+        Filtered DataFrame with offending IRs removed.
+    """
+    if ir_df.empty or not flanking_regions:
+        return ir_df
+
+    # Build lookup: (sample_id, contig) -> list of (cds_start, cds_end)
+    hmm_cds: dict[tuple[str, str], list[tuple[int, int]]] = {}
+    for region in flanking_regions:
+        key = (region.sample_id, region.contig)
+        hmm_cds.setdefault(key, []).append((region.cds_start, region.cds_end))
+
+    def _arm_inside_any_cds(row) -> bool:
+        key = (row["sample_id"], row["IR_Chr"])
+        cds_list = hmm_cds.get(key)
+        if not cds_list:
+            return False
+        ls, le = int(row["LeftIRStart"]), int(row["LeftIRStop"])
+        rs, re = int(row["RightIRStart"]), int(row["RightIRStop"])
+        for cds_s, cds_e in cds_list:
+            left_inside = (ls >= cds_s and le <= cds_e)
+            right_inside = (rs >= cds_s and re <= cds_e)
+            if left_inside or right_inside:
+                return True
+        return False
+
+    mask = ir_df.apply(_arm_inside_any_cds, axis=1)
+    n_removed = mask.sum()
+    if n_removed:
+        logger.info(
+            "Removed %d IR(s) with arm(s) inside HMM-hit CDS regions",
+            n_removed,
+        )
+    return ir_df.loc[~mask].reset_index(drop=True)
+
+
 def combine_ir_tables(
     ir_results: list[tuple[str, str, list[FlankingRegion]]],
     output_path: str,
