@@ -134,10 +134,10 @@ def run_hmmsearch_all_profiles(
     Returns:
         List of tblout file paths (one per profile).
     """
-    sample_dir = ensure_dir(os.path.join(outdir, sample.sample_id))
+    ensure_dir(outdir)
     tblouts = []
     for profile in profiles:
-        tblout = run_hmmsearch(sample, profile, sample_dir, cpus=cpus)
+        tblout = run_hmmsearch(sample, profile, outdir, cpus=cpus)
         tblouts.append(tblout)
     return tblouts
 
