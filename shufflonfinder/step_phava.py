@@ -536,6 +536,69 @@ def filter_irs_in_hmm_hits(
     return ir_df.loc[~mask].reset_index(drop=True)
 
 
+def _deduplicate_ir_by_coords(ir_df: pd.DataFrame) -> pd.DataFrame:
+    """Deduplicate IRs that share identical genome-absolute coordinates.
+
+    The same physical IR pair can appear multiple times when it falls
+    within the flanking regions of several HMM hits.  After remapping
+    to genome-absolute coordinates these rows are identical except for
+    the ``locus_tag`` / ``hit_id`` / ``hmm_profiles`` columns.  We
+    keep one representative row per unique coordinate set, merging the
+    HMM profile and locus tag information so nothing is lost.
+    """
+    if ir_df.empty:
+        return ir_df
+
+    coord_cols = [
+        "sample_id", "IR_Chr",
+        "LeftIRStart", "LeftIRStop",
+        "RightIRStart", "RightIRStop",
+    ]
+    # Verify all coordinate columns are present
+    missing = [c for c in coord_cols if c not in ir_df.columns]
+    if missing:
+        logger.warning(
+            "Cannot deduplicate IRs: missing columns %s", missing,
+        )
+        return ir_df
+
+    before = len(ir_df)
+
+    def _merge_group(group: pd.DataFrame) -> pd.Series:
+        """Collapse duplicate rows into one, merging metadata."""
+        row = group.iloc[0].copy()
+        if "hmm_profiles" in group.columns:
+            all_profiles = set()
+            for val in group["hmm_profiles"].dropna():
+                for p in str(val).split(";"):
+                    p = p.strip()
+                    if p:
+                        all_profiles.add(p)
+            row["hmm_profiles"] = ";".join(sorted(all_profiles))
+        if "locus_tag" in group.columns:
+            tags = sorted(set(group["locus_tag"].dropna().astype(str)))
+            row["locus_tag"] = ";".join(tags)
+        if "hit_id" in group.columns:
+            ids = sorted(set(group["hit_id"].dropna().astype(str)))
+            row["hit_id"] = ";".join(ids)
+        return row
+
+    deduped = (
+        ir_df.groupby(coord_cols, sort=False)
+        .apply(_merge_group, include_groups=False)
+        .reset_index(drop=True)
+    )
+
+    removed = before - len(deduped)
+    if removed:
+        logger.info(
+            "Coordinate deduplication: %d -> %d IRs "
+            "(%d duplicates from overlapping flanking regions removed)",
+            before, len(deduped), removed,
+        )
+    return deduped
+
+
 def combine_ir_tables(
     ir_results: list[tuple[str, str, list[FlankingRegion]]],
     output_path: str,
@@ -555,6 +618,7 @@ def combine_ir_tables(
         combined = pd.DataFrame()
     else:
         combined = pd.concat(frames, ignore_index=True)
+        combined = _deduplicate_ir_by_coords(combined)
 
     combined.to_csv(output_path, sep="\t", index=False)
     logger.info("Combined IR table: %d records -> %s", len(combined), output_path)
