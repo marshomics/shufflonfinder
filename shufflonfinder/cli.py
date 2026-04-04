@@ -122,10 +122,11 @@ def parse_args(argv=None):
         help="Window size (bp) for clustering nearby IRs (default: 3000).",
     )
     p.add_argument(
-        "--min-ir-arm-length", type=int, default=15,
+        "--min-ir-arm-length", type=int, default=13,
         help="Minimum IR arm length in bp to keep. Shufflon sfx "
-             "recognition sites are typically 19 bp; shorter arms are "
-             "usually coincidental matches (default: 15).",
+             "recognition sites are typically 19 bp, but einverted may "
+             "report shorter partial alignments for genuine sites "
+             "(default: 13).",
     )
     p.add_argument(
         "--max-ir-arm-length", type=int, default=35,
@@ -134,11 +135,13 @@ def parse_args(argv=None):
              "transposon or IS-element IRs (default: 35).",
     )
     p.add_argument(
-        "--min-ir-identity", type=float, default=90.0,
+        "--min-ir-identity", type=float, default=85.0,
         help="Minimum percent identity between IR arms to keep. "
-             "Shufflon sfx sites are highly conserved (typically "
-             "≥95%% identity); lower-identity matches are usually "
-             "coincidental (default: 90.0).",
+             "Within-type sfx pairs are near-perfect reverse "
+             "complements (≥95%%), but cross-type pairs and "
+             "divergent recognition sites may be lower; 85%% "
+             "retains genuine sites while excluding most noise "
+             "(default: 85.0).",
     )
     p.add_argument(
         "--min-ir-pairs", type=int, default=3,
