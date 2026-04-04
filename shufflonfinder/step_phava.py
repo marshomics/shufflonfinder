@@ -325,9 +325,9 @@ def detect_inverted_repeats(
             logger.warning("Empty flanking FASTA for %s, skipping IR detection", sample.sample_id)
             return ""
 
-    sample_dir = ensure_dir(os.path.join(outdir, sample.sample_id))
+    ensure_dir(outdir)
 
-    outfile_51, outfile_75 = run_einverted_dual(flanking_fasta, sample_dir, cpus=cpus)
+    outfile_51, outfile_75 = run_einverted_dual(flanking_fasta, outdir, cpus=cpus)
 
     raw_irs = merge_einverted_results(outfile_51, outfile_75)
     logger.info(
@@ -343,10 +343,10 @@ def detect_inverted_repeats(
     )
 
     ir_df = irs_to_dataframe(annotated)
-    export_irs_tsv(ir_df, sample_dir)
+    export_irs_tsv(ir_df, outdir)
 
     logger.info("IR detection complete for %s", sample.sample_id)
-    return sample_dir
+    return outdir
 
 
 # ---------------------------------------------------------------------------
