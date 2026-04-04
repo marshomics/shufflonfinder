@@ -21,9 +21,14 @@ The pipeline runs eight steps in sequence:
 
 7. **GFF generation and merging** converts both HMM hits and the surviving IRs into GFF3 features, then inserts them into the Prokka GFF between the annotation lines and the embedded FASTA section.
 
-8. **Window extraction** identifies CDS features overlapping each shufflon candidate cluster, finds invertible DNA segments between consecutive IR arms, and writes self-contained GFF+FASTA files for each candidate shufflon region. Each window GFF carries four annotation tracks: `inverted_repeat` features (from einverted and motif search, named `inverted_repeat_NN_FOR`/`inverted_repeat_NN_REV`), `hmm_hit` features (the recombinase gene with HMM profile info), `CDS` features (overlapping Prokka genes), and `invertible_segment` features (the DNA between consecutive IR arms, corresponding to shufflon cassettes).
+8. **Window extraction and classification** groups IR features by cluster (shufflon candidates carry a `cluster_id`; remaining quality-filtered IRs are grouped by proximity) and classifies each group into one of two categories:
 
-9. **Plot generation** produces PNG and SVG gene-organisation figures for each window GFF using [dna_features_viewer](https://github.com/Edinburgh-Genome-Foundry/DnaFeaturesViewer). Each plot has three visual tracks: inverted repeats as directional arrows above the annotation line, CDS and recombinase as directional arrows on the main line, and invertible segments as undirectional boxes below. Each IR pair gets a distinct colour (parsed from the feature name, e.g. `inverted_repeat_01_FOR`/`inverted_repeat_01_REV`), so overlapping pairs are visually distinguishable even when drawn on the same line. Other features are colour-coded by category: recombinases (red), invertible segments (orange), CDS containing inverted repeats (teal), and other CDS (grey). Identification is via legend only.
+   * **Shufflon-like** — at least `--min-ir-pairs` (default 3) complete pairs *and* every consecutive pair (sorted by position) is adjacent within 10 bp. This captures the R64/TP114-style organisation where sfx recognition sites sit at cassette boundaries in quick succession.
+   * **Inverton-like** — at least one complete IR pair within 2000 bp of an HMM-hit CDS. This captures simpler invertible elements near a recombinase that don't have the tightly packed multi-cassette layout of a shufflon.
+
+   Windows matching neither category are skipped. Each window GFF carries four annotation tracks: `inverted_repeat`, `hmm_hit`, `CDS`, and `invertible_segment`. Shufflon-like and inverton-like windows are written to separate subdirectories under `07_shufflon_windows/`.
+
+9. **Plot generation** produces PNG and SVG gene-organisation figures for each window GFF (both shufflon-like and inverton-like) using [dna_features_viewer](https://github.com/Edinburgh-Genome-Foundry/DnaFeaturesViewer). Each plot has three visual tracks: inverted repeats as directional arrows above the annotation line, CDS and recombinase as directional arrows on the main line, and invertible segments as undirectional boxes below. Each IR pair gets a distinct colour (parsed from the feature name, e.g. `inverted_repeat_01_FOR`/`inverted_repeat_01_REV`), so overlapping pairs are visually distinguishable even when drawn on the same line. Other features are colour-coded by category: recombinases (red), invertible segments (orange), CDS containing inverted repeats (teal), and other CDS (grey). Identification is via legend only.
 
 
 ## Prerequisites
@@ -181,11 +186,18 @@ results/
     │   ├── ir/                                # IR features as GFF
     │   └── merged/                            # Prokka + HMM + IR merged GFF
     └── 07_shufflon_windows/
-        ├── shufflon_windows_summary.tsv       # Per-sample summary table
-        ├── gffs/                              # Per-window GFF+FASTA files
-        │   └── <sample_id>_contig_*_window_*.gff
-        └── plots/                             # Per-window .png and .svg plots
-            └── <sample_id>_contig_*_window_*.png
+        ├── shufflon_like_summary.tsv          # Summary table (shufflon-like windows)
+        ├── inverton_like_summary.tsv          # Summary table (inverton-like windows)
+        ├── shufflon_like/
+        │   ├── gffs/                          # Per-window GFF+FASTA files
+        │   │   └── <sample_id>_contig_*_window_*.gff
+        │   └── plots/                         # Per-window .png and .svg plots
+        │       └── <sample_id>_contig_*_window_*.png
+        └── inverton_like/
+            ├── gffs/                          # Per-window GFF+FASTA files
+            │   └── <sample_id>_contig_*_window_*.gff
+            └── plots/                         # Per-window .png and .svg plots
+                └── <sample_id>_contig_*_window_*.png
 ```
 
 ### Key output files
@@ -198,11 +210,11 @@ results/
 
 `05_shufflon_filter/IRs_shufflon_candidates.tsv` contains the final set of IR pairs after density-based clustering, CDS overlap filtering, and motif-based sfx refinement. Includes `cluster_id` assignments and `unpaired_site` flags for recognition sites discovered by motif search that lack a detected partner arm.
 
-`07_shufflon_windows/shufflon_windows_summary.tsv` is the main results table. Each row represents one CDS feature within a candidate shufflon window. Columns include `sample_id`, `window_id`, `contig`, `window_start`, `window_end`, `window_length_bp`, `n_ir_pairs`, `ir_coords` (compact coordinate string for all IR pairs in the window), `locus_tag` (Prokka ID), `cds_start`, `cds_end`, `strand`, `product` (Prokka annotation), `cds_source`, `is_hmm_hit` (True if this CDS is the gene that triggered the HMM search), `hmm_profiles` (semicolon-separated profiles that matched, empty for non-hit genes), and `gff_path` (path to the per-window GFF+FASTA file).
+`07_shufflon_windows/shufflon_like_summary.tsv` and `inverton_like_summary.tsv` are the main results tables (one per category). Each row represents one CDS feature within a window. Columns include `sample_id`, `window_id`, `contig`, `window_start`, `window_end`, `window_length_bp`, `n_ir_pairs`, `ir_coords` (compact coordinate string for all IR pairs in the window), `locus_tag` (Prokka ID), `cds_start`, `cds_end`, `strand`, `product` (Prokka annotation), `cds_source`, `is_hmm_hit` (True if this CDS is the gene that triggered the HMM search), `hmm_profiles` (semicolon-separated profiles that matched, empty for non-hit genes), and `gff_path` (path to the per-window GFF+FASTA file).
 
-`07_shufflon_windows/gffs/` contains one GFF+FASTA file per candidate shufflon region. Each GFF has four annotation tracks: `inverted_repeat` features (from einverted or motif_search, named `inverted_repeat_NN_FOR`/`inverted_repeat_NN_REV`), `hmm_hit` features (the recombinase gene), `CDS` features (overlapping Prokka genes), and `invertible_segment` features (the DNA between consecutive IR arms).
+`07_shufflon_windows/shufflon_like/gffs/` and `inverton_like/gffs/` each contain one GFF+FASTA file per detected window. Each GFF has four annotation tracks: `inverted_repeat` features (from einverted or motif_search, named `inverted_repeat_NN_FOR`/`inverted_repeat_NN_REV`), `hmm_hit` features (the recombinase gene), `CDS` features (overlapping Prokka genes), and `invertible_segment` features (the DNA between consecutive IR arms).
 
-`07_shufflon_windows/plots/` contains PNG and SVG gene-organisation figures for each window. Each figure has three visual tracks: inverted repeats (each pair in a distinct colour) as directional arrows above the annotation line, CDS and recombinase as directional arrows on the main line, and invertible segments as undirectional boxes below. Features are identified by colour via a shared legend rather than inline labels.
+`07_shufflon_windows/shufflon_like/plots/` and `inverton_like/plots/` contain PNG and SVG gene-organisation figures for each window. Each figure has three visual tracks: inverted repeats (each pair in a distinct colour) as directional arrows above the annotation line, CDS and recombinase as directional arrows on the main line, and invertible segments as undirectional boxes below. Features are identified by colour via a shared legend rather than inline labels.
 
 
 ## HMM profiles
