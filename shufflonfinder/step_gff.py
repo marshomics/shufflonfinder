@@ -138,19 +138,23 @@ def ir_to_gff(ir_df: pd.DataFrame, output_dir: str) -> dict[str, str]:
             writer = csv.writer(fh, delimiter="\t")
             for counter, (_, row) in enumerate(group.iterrows(), start=1):
                 seq_num = f"{counter:04d}"
+                # Include cluster_id in attributes if available
+                cluster_attr = ""
+                if "cluster_id" in row.index and pd.notna(row.get("cluster_id")):
+                    cluster_attr = f";cluster_id={row['cluster_id']}"
                 # Left (forward) IR
                 writer.writerow([
                     row["IR_Chr"], "einverted", "inverted_repeat",
                     row["LeftIRStart"], row["LeftIRStop"],
                     ".", "+", ".",
-                    f"ID=inverted_repeat_{seq_num}_F;Name=inverted_repeat_{seq_num}_F",
+                    f"ID=inverted_repeat_{seq_num}_F;Name=inverted_repeat_{seq_num}_F{cluster_attr}",
                 ])
                 # Right (reverse) IR
                 writer.writerow([
                     row["IR_Chr"], "einverted", "inverted_repeat",
                     row["RightIRStart"], row["RightIRStop"],
                     ".", "-", ".",
-                    f"ID=inverted_repeat_{seq_num}_R;Name=inverted_repeat_{seq_num}_R",
+                    f"ID=inverted_repeat_{seq_num}_R;Name=inverted_repeat_{seq_num}_R{cluster_attr}",
                 ])
         files[sample_id] = gff_path
         logger.debug("Wrote IR GFF for %s: %d IR pairs", sample_id, len(group))
@@ -524,6 +528,44 @@ def _find_nearby_hmm_hits(
     return [h for h in hmm_features if expanded.overlaps(h)]
 
 
+def _group_irs_by_cluster(
+    ir_features: list[Feature],
+    window_size: int,
+) -> list[list[Feature]]:
+    """Group IR features by their cluster_id attribute.
+
+    If cluster_id attributes are present, IRs sharing the same cluster_id
+    form one group.  This preserves the cluster assignments made during
+    shufflon candidate filtering, so that adjacent-but-distinct shufflon
+    clusters produce separate windows.
+
+    Falls back to proximity-based grouping (``group_features_by_window``)
+    when no cluster_id attributes are found.
+    """
+    cluster_map: dict[str, list[Feature]] = defaultdict(list)
+    unclustered: list[Feature] = []
+
+    for ir in ir_features:
+        attrs = _parse_gff_attributes(ir.attributes)
+        cid = attrs.get("cluster_id", "")
+        if cid:
+            cluster_map[cid].append(ir)
+        else:
+            unclustered.append(ir)
+
+    if not cluster_map:
+        # No cluster_id on any feature — fall back to proximity grouping
+        return group_features_by_window(ir_features, window_size)
+
+    groups = [sorted(feats, key=lambda f: f.start) for feats in cluster_map.values()]
+
+    # Handle any unclustered IRs via proximity grouping
+    if unclustered:
+        groups.extend(group_features_by_window(unclustered, window_size))
+
+    return groups
+
+
 def extract_shufflon_windows(
     merged_gff: str,
     output_dir: str,
@@ -559,7 +601,11 @@ def extract_shufflon_windows(
     window_counter = defaultdict(int)
 
     for contig_id, ir_features in ir_by_contig.items():
-        ir_groups = group_features_by_window(ir_features, window_size)
+        # Group IRs by cluster_id if available, otherwise fall back to
+        # proximity-based grouping.  Cluster-based grouping keeps
+        # distinct shufflon candidate clusters as separate windows even
+        # when they are close together on the same contig.
+        ir_groups = _group_irs_by_cluster(ir_features, window_size)
         contig_cds = cds_by_contig.get(contig_id, [])
         contig_hmm = hmm_by_contig.get(contig_id, [])
         seq = sequences.get(contig_id, "")
