@@ -59,6 +59,7 @@ from .step_gff import (
     extract_shufflon_windows,
     shufflon_windows_to_tsv,
 )
+from .step_clinker import generate_clinker_plots
 
 logger = logging.getLogger("shufflonfinder")
 
@@ -413,6 +414,16 @@ def main(argv=None):
     # Write combined summary table
     summary_path = os.path.join(dirs["windows"], "shufflon_windows_summary.tsv")
     summary_df = shufflon_windows_to_tsv(all_windows, summary_path)
+
+    # ==================================================================
+    # Step 8: Generate Clinker plots for shufflon windows
+    # ==================================================================
+    logger.info("=" * 60)
+    logger.info("STEP 8: Generating Clinker plots")
+    logger.info("=" * 60)
+
+    clinker_plots = generate_clinker_plots(dirs["windows"])
+    logger.info("Generated %d Clinker plot(s)", len(clinker_plots))
 
     # ==================================================================
     # Summary
