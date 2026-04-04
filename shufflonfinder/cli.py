@@ -27,6 +27,8 @@ import logging
 import os
 import sys
 
+import pandas as pd
+
 from .utils import setup_logging, ensure_dir, check_tool
 from .sample_sheet import (
     Sample,
@@ -217,23 +219,6 @@ def main(argv=None):
     for tool in required_tools:
         check_tool(tool)
 
-    # ---- Subdirectories ----
-    dirs = {
-        "prokka":       ensure_dir(os.path.join(outdir, "01_prokka")),
-        "hmm":          ensure_dir(os.path.join(outdir, "02_hmmsearch")),
-        "hmm_profiles": ensure_dir(os.path.join(outdir, "02_hmmsearch", "profiles")),
-        "hmm_results":  ensure_dir(os.path.join(outdir, "02_hmmsearch", "results")),
-        "flanking":     ensure_dir(os.path.join(outdir, "03_flanking")),
-        "ir":           ensure_dir(os.path.join(outdir, "04_inverted_repeats")),
-        "shufflon":     ensure_dir(os.path.join(outdir, "05_shufflon_filter")),
-        "gff_hmm":      ensure_dir(os.path.join(outdir, "06_gff", "hmm_hits")),
-        "gff_ir":       ensure_dir(os.path.join(outdir, "06_gff", "ir")),
-        "gff_merged":   ensure_dir(os.path.join(outdir, "06_gff", "merged")),
-        "windows":      ensure_dir(os.path.join(outdir, "07_shufflon_windows")),
-        "window_gffs":  ensure_dir(os.path.join(outdir, "07_shufflon_windows", "gffs")),
-        "plots":        ensure_dir(os.path.join(outdir, "07_shufflon_windows", "plots")),
-    }
-
     # ==================================================================
     # Step 0: Resolve samples
     # ==================================================================
@@ -242,6 +227,33 @@ def main(argv=None):
     logger.info("=" * 60)
     samples = resolve_samples(args)
     logger.info("Loaded %d sample(s)", len(samples))
+
+    # ---- Per-sample directory trees ----
+    # Structure: outdir/<sample_id>/01_prokka/, 02_hmmsearch/, …, 07_shufflon_windows/
+    # Shared resources (HMM profiles) stay at outdir level.
+    def sample_dirs(sample_id: str) -> dict[str, str]:
+        root = ensure_dir(os.path.join(outdir, sample_id))
+        return {
+            "root":         root,
+            "prokka":       ensure_dir(os.path.join(root, "01_prokka")),
+            "hmm":          ensure_dir(os.path.join(root, "02_hmmsearch")),
+            "hmm_results":  ensure_dir(os.path.join(root, "02_hmmsearch", "results")),
+            "flanking":     ensure_dir(os.path.join(root, "03_flanking")),
+            "ir":           ensure_dir(os.path.join(root, "04_inverted_repeats")),
+            "shufflon":     ensure_dir(os.path.join(root, "05_shufflon_filter")),
+            "gff_hmm":      ensure_dir(os.path.join(root, "06_gff", "hmm_hits")),
+            "gff_ir":       ensure_dir(os.path.join(root, "06_gff", "ir")),
+            "gff_merged":   ensure_dir(os.path.join(root, "06_gff", "merged")),
+            "windows":      ensure_dir(os.path.join(root, "07_shufflon_windows")),
+            "window_gffs":  ensure_dir(os.path.join(root, "07_shufflon_windows", "gffs")),
+            "plots":        ensure_dir(os.path.join(root, "07_shufflon_windows", "plots")),
+        }
+
+    # Shared HMM profiles directory (prepared once, used by all samples)
+    hmm_profiles_dir = ensure_dir(os.path.join(outdir, "hmm_profiles"))
+
+    # Build dirs for each sample up front
+    sdirs = {s.sample_id: sample_dirs(s.sample_id) for s in samples}
 
     # ==================================================================
     # Step 1: Prokka (if needed)
@@ -252,7 +264,7 @@ def main(argv=None):
         logger.info("STEP 1: Running Prokka on %d sample(s)", len(prokka_needed))
         logger.info("=" * 60)
         for sample in prokka_needed:
-            run_prokka(sample, dirs["prokka"], cpus=args.cpus)
+            run_prokka(sample, sdirs[sample.sample_id]["prokka"], cpus=args.cpus)
     else:
         logger.info("STEP 1: Prokka — skipped (all samples pre-annotated)")
 
@@ -267,21 +279,31 @@ def main(argv=None):
     logger.info("STEP 2: HMM search (all profiles)")
     logger.info("=" * 60)
 
-    profiles = prepare_hmm_profiles(hmm_dir, dirs["hmm_profiles"])
+    profiles = prepare_hmm_profiles(hmm_dir, hmm_profiles_dir)
     logger.info("Searching %d HMM profiles against %d samples", len(profiles), len(samples))
 
     all_tblout_files = []
     for sample in samples:
+        sd = sdirs[sample.sample_id]
         tblouts = run_hmmsearch_all_profiles(
-            sample, profiles, dirs["hmm_results"], cpus=args.cpus
+            sample, profiles, sd["hmm_results"], cpus=args.cpus
         )
         for t in tblouts:
             all_tblout_files.append((t, sample.sample_id))
 
-    hits_combined_path = os.path.join(dirs["hmm"], "hmm_hits_combined.tsv")
-    hmm_hits_df = combine_and_filter_hmmsearch(
-        all_tblout_files, hits_combined_path, bitscore_threshold=args.bitscore
-    )
+    # Per-sample combined hits
+    hmm_hits_dfs = []
+    for sample in samples:
+        sd = sdirs[sample.sample_id]
+        sample_tblouts = [(t, sid) for t, sid in all_tblout_files if sid == sample.sample_id]
+        if sample_tblouts:
+            hits_path = os.path.join(sd["hmm"], "hmm_hits.tsv")
+            df = combine_and_filter_hmmsearch(
+                sample_tblouts, hits_path, bitscore_threshold=args.bitscore
+            )
+            hmm_hits_dfs.append(df)
+
+    hmm_hits_df = pd.concat(hmm_hits_dfs, ignore_index=True) if hmm_hits_dfs else pd.DataFrame()
 
     # ==================================================================
     # Step 3: Extract flanking DNA around each HMM hit
@@ -294,17 +316,16 @@ def main(argv=None):
     all_flanking_flat = []
 
     for sample in samples:
-        sample_hits = hmm_hits_df[hmm_hits_df["genome"] == sample.sample_id]
+        sd = sdirs[sample.sample_id]
+        sample_hits = hmm_hits_df[hmm_hits_df["genome"] == sample.sample_id] if not hmm_hits_df.empty else hmm_hits_df
         fasta_path, regions = extract_flanking_regions(
-            sample, sample_hits, dirs["flanking"], flank_bp=args.flank_bp
+            sample, sample_hits, sd["flanking"], flank_bp=args.flank_bp
         )
         all_flanking_regions.append((sample, fasta_path, regions))
         all_flanking_flat.extend(regions)
-
-    # Write combined flanking metadata
-    if all_flanking_flat:
-        flanking_tsv = os.path.join(dirs["flanking"], "flanking_regions_combined.tsv")
-        flanking_regions_to_tsv(all_flanking_flat, flanking_tsv)
+        if regions:
+            flanking_tsv = os.path.join(sd["flanking"], "flanking_regions.tsv")
+            flanking_regions_to_tsv(regions, flanking_tsv)
 
     # ==================================================================
     # Step 4: Inverted repeat detection (einverted) on flanking regions
@@ -317,25 +338,33 @@ def main(argv=None):
     for sample, fasta_path, regions in all_flanking_regions:
         if not regions:
             continue
+        sd = sdirs[sample.sample_id]
         ir_dir = detect_inverted_repeats(
-            sample, fasta_path, dirs["ir"], cpus=args.cpus,
+            sample, fasta_path, sd["ir"], cpus=args.cpus,
         )
         ir_results.append((ir_dir, sample.sample_id, regions))
 
-    ir_combined_path = os.path.join(dirs["ir"], "IRs_combined_remapped.tsv")
-    ir_df = combine_ir_tables(ir_results, ir_combined_path)
+    # Combine IR tables per sample (remapped to genome coords)
+    ir_dfs = []
+    for ir_dir, sample_id, regions in ir_results:
+        combined_path = os.path.join(sdirs[sample_id]["ir"], "IRs_remapped.tsv")
+        df = combine_ir_tables([(ir_dir, sample_id, regions)], combined_path)
+        ir_dfs.append(df)
+    ir_df = pd.concat(ir_dfs, ignore_index=True) if ir_dfs else pd.DataFrame()
 
     # Apply IR quality filters (arm length / identity)
-    if args.min_ir_arm_length > 0 or args.max_ir_arm_length > 0 or args.min_ir_identity > 0:
+    if not ir_df.empty and (args.min_ir_arm_length > 0 or args.max_ir_arm_length > 0 or args.min_ir_identity > 0):
         ir_df = filter_ir_table(
             ir_df,
             min_arm_length=args.min_ir_arm_length,
             max_arm_length=args.max_ir_arm_length,
             min_identity=args.min_ir_identity,
         )
-        ir_filtered_path = os.path.join(dirs["ir"], "IRs_combined_filtered.tsv")
-        ir_df.to_csv(ir_filtered_path, sep="\t", index=False)
-        logger.info("Filtered IR table: %d records -> %s", len(ir_df), ir_filtered_path)
+        # Write filtered table per sample
+        for sample_id, group in ir_df.groupby("sample_id"):
+            filtered_path = os.path.join(sdirs[sample_id]["ir"], "IRs_filtered.tsv")
+            group.to_csv(filtered_path, sep="\t", index=False)
+        logger.info("Filtered IR table: %d records", len(ir_df))
 
     # ==================================================================
     # Step 5: Shufflon candidate filtering (density + CDS overlap)
@@ -354,7 +383,6 @@ def main(argv=None):
     )
 
     # Motif-based refinement: detect sfx sites missed by einverted
-    # Collect genome sequences from all samples for motif searching
     all_sequences = {}
     for sample in samples:
         if sample.gff_path and os.path.isfile(sample.gff_path):
@@ -363,9 +391,11 @@ def main(argv=None):
     if all_sequences:
         ir_df = refine_sfx_sites(ir_df, all_sequences)
 
-    ir_shufflon_path = os.path.join(dirs["shufflon"], "IRs_shufflon_candidates.tsv")
-    ir_df.to_csv(ir_shufflon_path, sep="\t", index=False)
-    logger.info("Shufflon candidate IRs: %d records -> %s", len(ir_df), ir_shufflon_path)
+    # Write candidate IRs per sample
+    for sample_id, group in ir_df.groupby("sample_id"):
+        cand_path = os.path.join(sdirs[sample_id]["shufflon"], "IRs_shufflon_candidates.tsv")
+        group.to_csv(cand_path, sep="\t", index=False)
+    logger.info("Shufflon candidate IRs: %d records", len(ir_df))
 
     # ==================================================================
     # Step 6: Generate and merge GFF files
@@ -374,22 +404,25 @@ def main(argv=None):
     logger.info("STEP 6: GFF generation and merging")
     logger.info("=" * 60)
 
-    # Generate HMM hit GFFs (per sample, with proper coordinates from GFF)
-    hmm_gff_map = hmm_hits_to_gff(hmm_hits_df, samples, dirs["gff_hmm"])
-
-    # Generate IR GFFs (per sample, genome-absolute coordinates)
-    ir_gff_map = ir_to_gff(ir_df, dirs["gff_ir"])
-
-    # Merge into Prokka GFFs
     for sample in samples:
+        sd = sdirs[sample.sample_id]
+
+        # HMM hit GFF
+        sample_hits = hmm_hits_df[hmm_hits_df["genome"] == sample.sample_id] if not hmm_hits_df.empty else hmm_hits_df
+        hmm_gff_map = hmm_hits_to_gff(sample_hits, [sample], sd["gff_hmm"])
+
+        # IR GFF
+        sample_irs = ir_df[ir_df["sample_id"] == sample.sample_id] if not ir_df.empty else ir_df
+        ir_gff_map = ir_to_gff(sample_irs, sd["gff_ir"])
+
+        # Merge into Prokka GFF
         extra_gffs = []
         if sample.sample_id in hmm_gff_map:
             extra_gffs.append(hmm_gff_map[sample.sample_id])
         if sample.sample_id in ir_gff_map:
             extra_gffs.append(ir_gff_map[sample.sample_id])
 
-        merged_sample_dir = ensure_dir(os.path.join(dirs["gff_merged"], sample.sample_id))
-        merged_path = os.path.join(merged_sample_dir, f"{sample.sample_id}.gff")
+        merged_path = os.path.join(sd["gff_merged"], f"{sample.sample_id}.gff")
         merge_gff_into_prokka(sample.gff_path, extra_gffs, merged_path)
 
     # ==================================================================
@@ -401,32 +434,37 @@ def main(argv=None):
 
     all_windows = []
     for sample in samples:
-        merged_gff = os.path.join(dirs["gff_merged"], sample.sample_id, f"{sample.sample_id}.gff")
+        sd = sdirs[sample.sample_id]
+        merged_gff = os.path.join(sd["gff_merged"], f"{sample.sample_id}.gff")
         if not os.path.isfile(merged_gff):
             logger.warning("No merged GFF for %s, skipping window extraction", sample.sample_id)
             continue
 
         windows = extract_shufflon_windows(
             merged_gff,
-            os.path.join(dirs["window_gffs"], sample.sample_id),
+            sd["window_gffs"],
             sample_id=sample.sample_id,
             window_size=args.window_size,
         )
         all_windows.extend(windows)
 
-    # Write combined summary table
-    summary_path = os.path.join(dirs["windows"], "shufflon_windows_summary.tsv")
-    summary_df = shufflon_windows_to_tsv(all_windows, summary_path)
+        # Summary per sample
+        summary_path = os.path.join(sd["windows"], "shufflon_windows_summary.tsv")
+        shufflon_windows_to_tsv(windows, summary_path)
 
     # ==================================================================
-    # Step 8: Generate Clinker plots for shufflon windows
+    # Step 8: Generate shufflon plots
     # ==================================================================
     logger.info("=" * 60)
     logger.info("STEP 8: Generating shufflon plots")
     logger.info("=" * 60)
 
-    plot_files = generate_shufflon_plots(dirs["window_gffs"], dirs["plots"])
-    logger.info("Generated %d plot file(s)", len(plot_files))
+    total_plots = 0
+    for sample in samples:
+        sd = sdirs[sample.sample_id]
+        plot_files = generate_shufflon_plots(sd["window_gffs"], sd["plots"])
+        total_plots += len(plot_files)
+    logger.info("Generated %d plot file(s)", total_plots)
 
     # ==================================================================
     # Summary
