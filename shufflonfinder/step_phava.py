@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 import pandas as pd
 
 from .sample_sheet import Sample
-from .step_flanking import FlankingRegion, parse_fasta_file, parse_cds_from_gff
+from .step_flanking import FlankingRegion, parse_fasta_file
 from .utils import ensure_dir, run_cmd
 
 logger = logging.getLogger("shufflonfinder")
@@ -553,23 +553,6 @@ def _cluster_ir_rows(
     return clusters
 
 
-def _arm_overlaps_cds(
-    arm_start: int,
-    arm_stop: int,
-    cds_list: list,
-) -> bool:
-    """Check if an IR arm overlaps any CDS feature.
-
-    Uses 0-based coordinates throughout.  An arm overlaps a CDS if
-    [arm_start, arm_stop) intersects [cds.start-1, cds.end).
-    """
-    for cds in cds_list:
-        cds_s = cds.start - 1  # CdsCoords are 1-based
-        cds_e = cds.end
-        if arm_stop > cds_s and arm_start < cds_e:
-            return True
-    return False
-
 
 def _cluster_density(ir_df: pd.DataFrame, cluster_idx: list[int]) -> float:
     """Compute IR pair density (pairs per kilobase) for a cluster."""
@@ -597,16 +580,22 @@ def filter_shufflon_candidates(
       1. At least ``min_ir_pairs`` IR pairs within a cluster (clustered at
          ``cluster_distance`` bp gaps).
       2. A density of at least ``min_ir_density`` IR pairs per kilobase.
-      3. At least one IR arm in the cluster overlapping a CDS.
 
-    Shufflons pack multiple recognition sites into a few kilobases, so the
-    density requirement is critical for distinguishing them from regions
-    where transposon or IS-element IRs happen to accumulate near a
-    recombinase gene.
+    Every IR in the input already comes from the flanking region of a
+    recombinase HMM hit (within ±flank_bp of the gene), so proximity to a
+    recombinase is guaranteed by construction.  The count and density
+    requirements are sufficient to distinguish real shufflon recognition
+    site clusters from sparse transposon or IS-element IRs.
+
+    Note: CDS overlap is intentionally NOT required.  Shufflon cassettes
+    contain partial genes (truncated C-terminal segments) that Prodigal
+    cannot predict, so a CDS overlap test would reject genuine shufflons.
+    The pipeline's own ORF finder (step_gff) discovers these partial
+    CDS after the cluster has been accepted.
 
     Args:
         ir_df: Remapped IR DataFrame (genome-absolute coordinates).
-        samples: List of all Sample objects (for GFF CDS lookup).
+        samples: List of all Sample objects.
         cluster_distance: Maximum gap (bp) between IR pairs for chaining
             into one cluster.  Default 1000 (tighter than the window
             extraction distance, to isolate the dense shufflon core).
@@ -621,22 +610,6 @@ def filter_shufflon_candidates(
     """
     if ir_df.empty:
         return ir_df
-
-    # Build a CDS lookup per (sample, contig)
-    sample_map = {s.sample_id: s for s in samples}
-    cds_cache: dict[str, dict[str, list]] = {}
-
-    def _get_cds(sample_id: str, contig: str) -> list:
-        if sample_id not in cds_cache:
-            sample = sample_map.get(sample_id)
-            if sample and sample.gff_path:
-                by_contig: dict[str, list] = {}
-                for cds in parse_cds_from_gff(sample.gff_path).values():
-                    by_contig.setdefault(cds.contig, []).append(cds)
-                cds_cache[sample_id] = by_contig
-            else:
-                cds_cache[sample_id] = {}
-        return cds_cache[sample_id].get(contig, [])
 
     before = len(ir_df)
     keep_indices = []
@@ -662,20 +635,6 @@ def filter_shufflon_candidates(
                 )
                 continue
 
-            # --- CDS overlap check ---
-            has_cds_overlap = False
-            for idx in cluster_idx:
-                row = ir_df.loc[idx]
-                contig = str(row["IR_Chr"])
-                cds_list = _get_cds(sample_id, contig)
-                if (_arm_overlaps_cds(int(row["LeftIRStart"]), int(row["LeftIRStop"]), cds_list)
-                        or _arm_overlaps_cds(int(row["RightIRStart"]), int(row["RightIRStop"]), cds_list)):
-                    has_cds_overlap = True
-                    break
-
-            if not has_cds_overlap:
-                continue
-
             cid = f"{sample_id}_cluster_{ci + 1}"
             for idx in cluster_idx:
                 keep_indices.append(idx)
@@ -692,7 +651,7 @@ def filter_shufflon_candidates(
     n_clusters = result["cluster_id"].nunique()
     logger.info(
         "Shufflon candidate filter: %d -> %d IRs in %d cluster(s) "
-        "(removed %d IRs from sparse or non-coding regions)",
+        "(removed %d IRs from sparse regions)",
         before, len(result), n_clusters, removed,
     )
     return result
