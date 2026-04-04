@@ -11,5 +11,5 @@ dependencies:
   - pandas>=1.5
   - pip
   - pip:
-    - clinker>=0.0.28
+    - dna_features_viewer>=3.1
     - -e .
