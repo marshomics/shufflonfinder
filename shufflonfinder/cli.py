@@ -129,10 +129,11 @@ def parse_args(argv=None):
              "(default: 13).",
     )
     p.add_argument(
-        "--max-ir-arm-length", type=int, default=35,
-        help="Maximum IR arm length in bp to keep. Shufflon sfx recognition "
-             "sites are typically 19 bp; longer arms usually come from "
-             "transposon or IS-element IRs (default: 35).",
+        "--max-ir-arm-length", type=int, default=50,
+        help="Maximum IR arm length in bp to keep. Individual sfx sites "
+             "are ~19 bp, but einverted can align across two abutting "
+             "sites producing arms up to ~40 bp; 50 accommodates this "
+             "while excluding transposon/IS-element IRs (default: 50).",
     )
     p.add_argument(
         "--min-ir-identity", type=float, default=85.0,
