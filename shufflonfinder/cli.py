@@ -51,6 +51,7 @@ from .step_phava import (
     detect_inverted_repeats,
     combine_ir_tables,
     filter_ir_table,
+    filter_irs_in_hmm_hits,
     filter_shufflon_candidates,
     refine_sfx_sites,
 )
@@ -365,6 +366,10 @@ def main(argv=None):
             filtered_path = os.path.join(sdirs[sample_id]["ir"], "IRs_filtered.tsv")
             group.to_csv(filtered_path, sep="\t", index=False)
         logger.info("Filtered IR table: %d records", len(ir_df))
+
+    # Remove IRs whose arms fall inside a recombinase CDS
+    if not ir_df.empty:
+        ir_df = filter_irs_in_hmm_hits(ir_df, all_flanking_flat)
 
     # ==================================================================
     # Step 5: Shufflon candidate filtering (density + CDS overlap)
