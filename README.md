@@ -1,11 +1,11 @@
 # shufflonfinder
 
-Annotate shufflon structures in bacterial genomes. Searches predicted proteins against a library of HMM profiles targeting shufflon-associated recombinases (e.g. Rci), extracts flanking DNA around each hit, detects inverted repeats in those flanking regions using EMBOSS einverted, filters for dense IR clusters where at least one repeat arm overlaps a coding sequence, and produces merged GFF annotations with windowed output for each candidate shufflon locus.
+Annotate shufflon structures in bacterial genomes. Searches predicted proteins against a library of HMM profiles targeting shufflon-associated recombinases (e.g. Rci), extracts flanking DNA around each hit, detects inverted repeats in those flanking regions using EMBOSS einverted, applies motif-based refinement to recover sfx recognition sites missed by pairwise alignment, filters for dense IR clusters, and produces merged GFF annotations with windowed output and Clinker visualisations for each candidate shufflon locus.
 
 
 ## How it works
 
-The pipeline runs seven steps in sequence:
+The pipeline runs eight steps in sequence:
 
 1. **Prokka** annotates raw genome FASTAs to produce protein sequences (.faa), gene coordinates (.gff), and contigs (.fna). Skipped when you supply pre-annotated inputs via a sample sheet.
 
@@ -15,11 +15,15 @@ The pipeline runs seven steps in sequence:
 
 4. **Inverted repeat detection** runs EMBOSS `einverted` at two sensitivity thresholds (51 and 75) on the flanking FASTAs, merges the results with coordinate-based deduplication (preserving distinct pairs in dense clusters), extracts arm sequences, and computes percent identity between arms. IR coordinates are then translated from flanking-region-local back to genome-absolute positions.
 
-5. **Shufflon candidate filtering** clusters nearby IRs on each contig within a configurable window (default 3 kb). Clusters with fewer than `--min-ir-pairs` (default 2) IR pairs are discarded. Remaining clusters must have at least one IR arm overlapping a coding sequence. This selects for the dense repeat architecture characteristic of shufflons while filtering out isolated or intergenic repeats.
+5. **Shufflon candidate filtering** clusters nearby IRs on each contig using density-based gap chaining with `--cluster-distance` (default 1000 bp). Clusters with fewer than `--min-ir-pairs` (default 3) IR pairs or density below `--min-ir-density` (default 1.0 pairs/kb) are discarded. Remaining clusters must have at least one IR arm overlapping a coding sequence.
 
-6. **GFF generation and merging** converts both HMM hits and the surviving IRs into GFF3 features, then inserts them into the Prokka GFF between the annotation lines and the embedded FASTA section.
+6. **Motif-based sfx refinement** derives a core recognition motif from the arms detected in each cluster, then scans the surrounding genomic sequence for additional sfx sites that einverted missed. einverted finds IR pairs by pairwise alignment, so it only detects sfx combinations with sufficient identity to each other; cross-type sfx pairings (e.g. sfxA vs. sfxD') that share the conserved core but diverge in flanking bases are often missed. Extended pairs — einverted artifacts where an arm bridges across two adjacent sfx sites — are identified using a median-based arm-length ratio test (>1.4× the cluster median) and replaced with the individual sites they span. Newly discovered sites that lack a detected partner are stored as unpaired recognition sites.
 
-7. **Window extraction** identifies CDS features overlapping each shufflon candidate cluster, finds invertible DNA segments between IR arms, predicts ORFs within those segments (to recover small cassette genes that Prokka may have missed), and writes self-contained GFF+FASTA files for each candidate shufflon region. Each window GFF has five annotation tracks: inverted repeats, HMM hits, Prokka CDS, invertible segments, and predicted shufflon cassette ORFs.
+7. **GFF generation and merging** converts both HMM hits and the surviving IRs into GFF3 features, then inserts them into the Prokka GFF between the annotation lines and the embedded FASTA section.
+
+8. **Window extraction** identifies CDS features overlapping each shufflon candidate cluster, finds invertible DNA segments between consecutive IR arms, and writes self-contained GFF+FASTA files for each candidate shufflon region. Each window GFF carries four annotation tracks: `inverted_repeat` features (from einverted and motif search, named `inverted_repeat_NN_FOR`/`inverted_repeat_NN_REV`), `hmm_hit` features (the recombinase gene with HMM profile info), `CDS` features (overlapping Prokka genes), and `invertible_segment` features (the DNA between consecutive IR arms, corresponding to shufflon cassettes).
+
+9. **Clinker visualisation** generates an interactive HTML gene-cluster comparison plot for each window GFF using [Clinker](https://github.com/gamcil/clinker). Features are colour-coded by category: recombinases (red), inverted repeats (steel blue), invertible segments (orange), CDS containing inverted repeats (teal), and other CDS (grey). Clinker outputs are written to a dedicated `clinker/` subdirectory within `07_shufflon_windows/`.
 
 
 ## Prerequisites
@@ -32,11 +36,12 @@ External tools (installed via conda):
 - [HMMER](http://hmmer.org/) >= 3.3
 - [EMBOSS](http://emboss.sourceforge.net/) >= 6.6 (provides `einverted`)
 
-Python libraries (installed via conda):
+Python libraries (installed via pip):
 
 - Python >= 3.9
 - Biopython >= 1.80
 - pandas >= 1.5
+- [clinker](https://github.com/gamcil/clinker) >= 0.0.28
 
 
 ## Installation
@@ -58,6 +63,7 @@ shufflonfinder --help
 prokka --version
 hmmsearch -h | head -1
 einverted --help
+clinker --version
 ```
 
 The 41 HMM profiles ship with the package in `shufflonfinder/hmms/`. No additional downloads are needed.
@@ -135,11 +141,12 @@ The directory can contain `.hmm` or `.hmm.gz` files. Each file should hold one H
 --bitscore FLOAT      Minimum HMM bitscore to keep a hit (default: 25.0)
 --flank-bp INT        DNA to extract on each side of a hit protein, in bp (default: 5000)
 --window-size INT     Max distance in bp for window extraction context (default: 3000)
---min-ir-arm-length INT  Minimum IR arm length in bp to keep (default: 10)
---min-ir-identity FLOAT  Minimum percent identity between IR arms (default: 70.0)
---min-ir-pairs INT    Minimum IR pairs per cluster to qualify as shufflon candidate (default: 3)
---cluster-distance INT  Max gap between IR pairs for chaining into one cluster (default: 1000)
---min-ir-density FLOAT  Minimum IR pairs per kilobase in a cluster (default: 2.0)
+--min-ir-arm-length INT   Minimum IR arm length in bp to keep (default: 13)
+--max-ir-arm-length INT   Maximum IR arm length in bp to keep (default: 35)
+--min-ir-identity FLOAT   Minimum percent identity between IR arms (default: 85.0)
+--min-ir-pairs INT        Minimum IR pairs per cluster to qualify as shufflon candidate (default: 3)
+--cluster-distance INT    Max gap between IR pairs for chaining into one cluster (default: 1000)
+--min-ir-density FLOAT    Minimum IR pairs per kilobase in a cluster (default: 1.0)
 --skip-prokka         Skip Prokka even for FASTA inputs
 -v                    Verbose output (use -vv for debug)
 -q                    Quiet mode (errors only)
@@ -163,14 +170,16 @@ results/
 │   ├── IRs_combined_remapped.tsv   # All IRs in genome-absolute coordinates
 │   └── IRs_combined_filtered.tsv   # After arm-length and identity filters
 ├── 05_shufflon_filter/
-│   └── IRs_shufflon_candidates.tsv # After density + CDS overlap filtering
+│   └── IRs_shufflon_candidates.tsv # After density + CDS overlap + motif refinement
 ├── 06_gff/
 │   ├── hmm_hits/                   # HMM hit CDS features as GFF
 │   ├── ir/                         # IR features as GFF
 │   └── merged/                     # Prokka + HMM + IR merged GFFs
 └── 07_shufflon_windows/
     ├── shufflon_windows_summary.tsv  # Combined summary table (all samples)
-    └── <sample_id>/                  # Per-window GFF+FASTA files
+    ├── <sample_id>/                  # Per-window GFF+FASTA files
+    └── clinker/                      # Clinker visualisations
+        └── <sample_id>/              # Per-window .html plots, .gbk, colour/function CSVs
 ```
 
 ### Key output files
@@ -181,14 +190,18 @@ results/
 
 `04_inverted_repeats/IRs_combined_remapped.tsv` contains all detected inverted repeats with coordinates translated back to the original contigs, plus arm sequences and percent identity.
 
-`06_shufflon_windows/shufflon_windows_summary.tsv` is the main results table. Each row represents one CDS feature within a candidate shufflon window. Columns include `sample_id`, `window_id`, `contig`, `window_start`, `window_end`, `window_length_bp`, `n_ir_pairs`, `ir_coords` (compact coordinate string for all IR pairs in the window), `locus_tag` (Prokka ID), `cds_start`, `cds_end`, `strand`, `product` (Prokka annotation), `cds_source`, `is_hmm_hit` (True if this CDS is the gene that triggered the HMM search), `hmm_profiles` (semicolon-separated profiles that matched, empty for non-hit genes), and `gff_path` (path to the per-window GFF+FASTA file).
+`05_shufflon_filter/IRs_shufflon_candidates.tsv` contains the final set of IR pairs after density-based clustering, CDS overlap filtering, and motif-based sfx refinement. Includes `cluster_id` assignments and `unpaired_site` flags for recognition sites discovered by motif search that lack a detected partner arm.
 
-`07_shufflon_windows/<sample_id>/` contains one GFF+FASTA file per candidate shufflon region. Each GFF has five annotation tracks: `inverted_repeat` features (from einverted), `hmm_hit` features (the recombinase gene with HMM profile info), `CDS` features (overlapping Prokka genes), `invertible_segment` features (the DNA between consecutive IR arms, corresponding to shufflon cassettes), and predicted `CDS` features from shufflonfinder's own ORF finder for small cassette genes that Prokka may have missed (e.g. the PilV C-terminal segments in R64-type shufflons).
+`07_shufflon_windows/shufflon_windows_summary.tsv` is the main results table. Each row represents one CDS feature within a candidate shufflon window. Columns include `sample_id`, `window_id`, `contig`, `window_start`, `window_end`, `window_length_bp`, `n_ir_pairs`, `ir_coords` (compact coordinate string for all IR pairs in the window), `locus_tag` (Prokka ID), `cds_start`, `cds_end`, `strand`, `product` (Prokka annotation), `cds_source`, `is_hmm_hit` (True if this CDS is the gene that triggered the HMM search), `hmm_profiles` (semicolon-separated profiles that matched, empty for non-hit genes), and `gff_path` (path to the per-window GFF+FASTA file).
+
+`07_shufflon_windows/<sample_id>/` contains one GFF+FASTA file per candidate shufflon region. Each GFF has four annotation tracks: `inverted_repeat` features (from einverted or motif_search, named `inverted_repeat_NN_FOR`/`inverted_repeat_NN_REV`), `hmm_hit` features (the recombinase gene), `CDS` features (overlapping Prokka genes), and `invertible_segment` features (the DNA between consecutive IR arms).
+
+`07_shufflon_windows/clinker/<sample_id>/` contains Clinker outputs for each window: an interactive HTML plot, a GenBank file (.gbk) used as Clinker input, and CSV files mapping genes to functional categories and colours.
 
 
 ## HMM profiles
 
-The bundled profiles (41 total) come from Pfam, PANTHER, TIGRFAM, Gene3D, PIRSF, and other databases, selected for their association with shufflon-specific recombinases (Rci family), site-specific DNA invertases, and related mobile genetic element components. These recombinases catalyze the inversions at sfx recognition sites that define shufflon activity.
+The bundled profiles (41 total) come from Pfam, PANTHER, TIGRFAM, Gene3D, PIRSF, and other databases, selected for their association with shufflon-specific recombinases (Rci family), site-specific DNA invertases, and related mobile genetic element components. These recombinases catalyse the inversions at sfx recognition sites that define shufflon activity.
 
 A protein counts as a hit if it scores at or above `--bitscore` against any profile. Proteins matching multiple profiles are deduplicated at the flanking extraction step so each genomic locus is scanned for IRs exactly once.
 
@@ -197,34 +210,35 @@ A protein counts as a hit if it scores at or above `--bitscore` against any prof
 
 einverted is run at two sensitivity thresholds (51 and 75) with different scoring matrices. Results from both runs are merged using coordinate-based deduplication: a threshold-51 pair is discarded only if a threshold-75 pair exists with all four arm coordinates within 3 bp (i.e. the same detection at different sensitivity). Distinct pairs that happen to share a dense genomic region are preserved. This matters for shufflons, which can pack multiple sfx recognition sites into a few kilobases. A hardcoded minimum of 30 bp between the two arms filters out trivially close pairs.
 
-After detection, two configurable filters are applied:
+After detection, three configurable filters are applied:
 
-`--min-ir-arm-length` sets the minimum length (in bp) for both the left and right arms of an IR pair. Short arms are more likely to be noise. The default is 10 bp.
+`--min-ir-arm-length` (default 13 bp) sets the minimum length for both the left and right arms of an IR pair. Shufflon sfx recognition sites are typically 19 bp, but einverted may report shorter partial alignments for genuine sites. The default retains these while filtering noise.
 
-`--min-ir-identity` sets the minimum percent identity between the two arms. Identity is computed from the extracted arm sequences (left arm vs. reverse complement of right arm). The default is 70%.
+`--max-ir-arm-length` (default 35 bp) sets the maximum arm length. Arms longer than this typically come from transposon or IS-element IRs, or from einverted extending across two abutting sfx sites. The median-based extended pair detection in the motif refinement step handles the latter case more precisely, but this hard ceiling provides an additional filter.
+
+`--min-ir-identity` (default 85.0%) sets the minimum percent identity between the two arms. Within-type sfx pairs are near-perfect reverse complements (≥95%), but cross-type pairs and divergent recognition sites may be lower. The default retains genuine cross-type sfx pairings while filtering most noise.
 
 Both the unfiltered (`IRs_combined_remapped.tsv`) and filtered (`IRs_combined_filtered.tsv`) tables are written to the `04_inverted_repeats/` output directory, so you can always inspect what was removed.
-
-To disable filtering entirely, set both thresholds to zero:
-
-```bash
-shufflonfinder --input-fasta genomes/ --outdir results/ --min-ir-arm-length 0 --min-ir-identity 0
-```
 
 
 ## Shufflon candidate filtering
 
-After the basic arm-length and identity filters, a second stage selects for the dense inverted repeat clusters characteristic of shufflons. IRs on the same contig are clustered by proximity using `--cluster-distance` (default 1000bp): two IR pairs belong to the same cluster if any of their arms is within this distance. This is deliberately tighter than `--window-size` (used later for window extraction context) to isolate the dense shufflon core from neighboring transposon or IS-element repeats that happen to share the same genomic region.
+After the basic arm-length and identity filters, a second stage selects for the dense inverted repeat clusters characteristic of shufflons. IRs on the same contig are clustered by proximity using `--cluster-distance` (default 1000 bp): two IR pairs belong to the same cluster if any of their arms is within this distance. This is deliberately tighter than `--window-size` (used later for window extraction context) to isolate the dense shufflon core from neighbouring transposon or IS-element repeats that happen to share the same genomic region.
 
 Clusters must pass three tests:
 
 `--min-ir-pairs` (default 3) sets the minimum number of IR pairs. A shufflon with two invertible segments has at least three recognition sites, which produce at least three detected IR pairs.
 
-`--min-ir-density` (default 2.0 pairs/kb) filters out clusters where the IRs are spread too thinly. Characterized shufflons like R64's pack 7 sfx sites into ~2kb (3.5 pairs/kb). Regions where transposon IRs happen to accumulate near a recombinase gene rarely exceed 1.5 pairs/kb because the individual transposon IRs are spaced further apart.
+`--min-ir-density` (default 1.0 pairs/kb) filters out clusters where the IRs are spread too thinly. Characterised shufflons like R64's pack 7 sfx sites into ~2 kb (3.5 pairs/kb). The default is set conservatively to accommodate shufflons where einverted detects fewer of the pairwise sfx combinations.
 
-At least one IR arm in the cluster must overlap a coding sequence. In characterized shufflons, inverted repeats are found within and flanking the invertible gene segments. Clusters where all repeats fall in intergenic regions are discarded.
+At least one IR arm in the cluster must overlap a coding sequence. In characterised shufflons, inverted repeats are found within and flanking the invertible gene segments. Clusters where all repeats fall in intergenic regions are discarded.
 
-The unfiltered and basic-filtered tables are in `04_inverted_repeats/`, while the shufflon-filtered table is in `05_shufflon_filter/`, so you can inspect what was removed at each stage.
+
+## Motif-based sfx refinement
+
+einverted detects IR pairs by pairwise alignment, which means it only finds sfx site combinations with sufficient mutual identity. In a shufflon with multiple sfx types (e.g. sfxA, sfxB, sfxC, sfxD'), all types share a conserved core sequence (~13 bp in R64) but differ in their flanking bases. Cross-type pairings like sfxA–sfxD' may fall below einverted's detection threshold (~94.7% identity for 19 bp sites differing at one position).
+
+The motif refinement step addresses this by extracting a core motif from the IR arms already detected in each cluster, then scanning the surrounding genomic sequence for additional sites matching that core. Extended pairs — einverted artifacts where a single detected arm bridges across two adjacent sfx sites — are identified when both arms exceed 1.4× the cluster's median arm length, removed from the IR table, and their constituent individual sites are recovered by the motif scan instead. Newly discovered sites are stored as unpaired recognition sites with their partner coordinates set to NA.
 
 
 ## Project layout
@@ -239,9 +253,10 @@ shufflonfinder/
 │   ├── step_prokka.py           # Prokka wrapper
 │   ├── step_hmmsearch.py        # Multi-profile HMM search
 │   ├── step_flanking.py         # Flanking DNA extraction + deduplication
-│   ├── step_phava.py            # einverted IR detection + coordinate remapping
+│   ├── step_phava.py            # einverted IR detection + motif refinement
 │   ├── step_ir_cds.py           # IR-CDS containment annotation
 │   ├── step_gff.py              # GFF generation, merging, window extraction
+│   ├── step_clinker.py          # Clinker plot generation
 │   └── hmms/                    # Bundled HMM profiles (.hmm.gz)
 ├── pyproject.toml               # Package metadata + console_scripts
 ├── environment.yml              # Conda + pip environment
