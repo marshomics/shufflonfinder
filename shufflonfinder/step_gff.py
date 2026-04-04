@@ -137,27 +137,32 @@ def ir_to_gff(ir_df: pd.DataFrame, output_dir: str) -> dict[str, str]:
         with open(gff_path, "w", newline="") as fh:
             writer = csv.writer(fh, delimiter="\t")
             for counter, (_, row) in enumerate(group.iterrows(), start=1):
-                seq_num = f"{counter:04d}"
+                seq_num = f"{counter:02d}"
+                is_unpaired = row.get("unpaired_site", False) is True
                 # Include cluster_id in attributes if available
                 cluster_attr = ""
                 if "cluster_id" in row.index and pd.notna(row.get("cluster_id")):
                     cluster_attr = f";cluster_id={row['cluster_id']}"
-                # Left (forward) IR
-                writer.writerow([
-                    row["IR_Chr"], "einverted", "inverted_repeat",
-                    row["LeftIRStart"], row["LeftIRStop"],
-                    ".", "+", ".",
-                    f"ID=inverted_repeat_{seq_num}_F;Name=inverted_repeat_{seq_num}_F{cluster_attr}",
-                ])
-                # Right (reverse) IR
-                writer.writerow([
-                    row["IR_Chr"], "einverted", "inverted_repeat",
-                    row["RightIRStart"], row["RightIRStop"],
-                    ".", "-", ".",
-                    f"ID=inverted_repeat_{seq_num}_R;Name=inverted_repeat_{seq_num}_R{cluster_attr}",
-                ])
+                source = "motif_search" if is_unpaired else "einverted"
+                # Left (forward) IR — skip if unpaired R-site
+                has_left = pd.notna(row.get("LeftIRStart")) and row.get("LeftIRSequence", "") != ""
+                has_right = pd.notna(row.get("RightIRStart")) and row.get("RightIRSequence", "") != ""
+                if has_left:
+                    writer.writerow([
+                        row["IR_Chr"], source, "inverted_repeat",
+                        int(row["LeftIRStart"]), int(row["LeftIRStop"]),
+                        ".", "+", ".",
+                        f"ID=inverted_repeat_{seq_num}_FOR;Name=inverted_repeat_{seq_num}_FOR{cluster_attr}",
+                    ])
+                if has_right:
+                    writer.writerow([
+                        row["IR_Chr"], source, "inverted_repeat",
+                        int(row["RightIRStart"]), int(row["RightIRStop"]),
+                        ".", "-", ".",
+                        f"ID=inverted_repeat_{seq_num}_REV;Name=inverted_repeat_{seq_num}_REV{cluster_attr}",
+                    ])
         files[sample_id] = gff_path
-        logger.debug("Wrote IR GFF for %s: %d IR pairs", sample_id, len(group))
+        logger.debug("Wrote IR GFF for %s: %d IR entries", sample_id, len(group))
 
     return files
 
@@ -410,19 +415,26 @@ def _find_invertible_cassettes(
     Returns a list of (start, end) tuples in the same coordinate space
     as the input features (0-based start, 1-based end).
     """
-    # Group IR features into left/right pairs by their ID prefix
+    # Group IR features into left/right pairs by their ID prefix.
+    # Supports both old (_F/_R) and new (_FOR/_REV) naming conventions.
     pairs = {}
     for ir in ir_group:
         attrs = _parse_gff_attributes(ir.attributes)
         ir_id = attrs.get("ID", "")
-        if ir_id.endswith("_F"):
+        if ir_id.endswith("_FOR"):
+            pairs.setdefault(ir_id[:-4], {})["F"] = ir
+        elif ir_id.endswith("_REV"):
+            pairs.setdefault(ir_id[:-4], {})["R"] = ir
+        elif ir_id.endswith("_F"):
             pairs.setdefault(ir_id[:-2], {})["F"] = ir
         elif ir_id.endswith("_R"):
             pairs.setdefault(ir_id[:-2], {})["R"] = ir
         else:
             pairs.setdefault(ir_id, {})["?"] = ir
 
-    # Each pair defines a cassette span
+    # Each complete pair (both F and R) defines a cassette span.
+    # Unpaired sites (from motif refinement) are skipped here — they are
+    # recognition sites that do not define an invertible segment on their own.
     raw_cassettes = []
     for pair_id, sides in pairs.items():
         f = sides.get("F")
@@ -665,8 +677,9 @@ def extract_shufflon_windows(
 
                 # Track 1: inverted repeats
                 for ir in ir_group:
+                    ir_source = ir.source if ir.source else "einverted"
                     fh.write(
-                        f"{seq_id}\teinverted\tinverted_repeat\t"
+                        f"{seq_id}\t{ir_source}\tinverted_repeat\t"
                         f"{ir.start - win_start + 1}\t{ir.end - win_start}\t.\t"
                         f"{ir.strand}\t.\t{ir.attributes}\n"
                     )
@@ -779,7 +792,11 @@ def shufflon_windows_to_tsv(
         for ir in win.ir_features:
             attrs = _parse_gff_attributes(ir.attributes)
             ir_id = attrs.get("ID", "")
-            if ir_id.endswith("_F"):
+            if ir_id.endswith("_FOR"):
+                ir_pairs[ir_id[:-4]]["F"] = ir
+            elif ir_id.endswith("_REV"):
+                ir_pairs[ir_id[:-4]]["R"] = ir
+            elif ir_id.endswith("_F"):
                 ir_pairs[ir_id[:-2]]["F"] = ir
             elif ir_id.endswith("_R"):
                 ir_pairs[ir_id[:-2]]["R"] = ir
