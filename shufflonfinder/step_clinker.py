@@ -201,18 +201,78 @@ def _strand_int(strand_str: str) -> int:
     return 0
 
 
-def _build_plot(classified: list[dict], seq_length: int, title: str) -> plt.Figure:
-    """Build a three-track matplotlib figure.
+def _draw_ir_arrows(ax, ir_data: list[dict], seq_length: int, y_center: float = 0.55):
+    """Draw IR features as small directional arrows directly on *ax*.
 
-    Top track:    inverted repeats — each pair in a distinct colour, all on
-                  one line (no stacking even when features overlap).
-    Middle track: CDS + recombinase (directional arrows, with backbone line).
-    Bottom track: invertible segments (undirectional boxes, no line).
+    All IRs sit on the same horizontal line at *y_center* (in data
+    coordinates of the CDS axes).  Each entry in *ir_data* is a dict
+    with keys: start, end, strand, colour.
+
+    Arrows point right for ``+``, left for ``-``, and are drawn as
+    simple filled polygons (a rectangle body with a triangular tip).
+    """
+    arrow_h = 0.14  # half-height of the arrow body
+    head_len_frac = 0.3  # fraction of feature length used for arrowhead
+
+    for ir in ir_data:
+        s, e = ir["start"], ir["end"]
+        colour = ir["colour"]
+        strand = ir["strand"]
+        length = e - s
+        head_len = min(length * head_len_frac, seq_length * 0.008)
+
+        if strand == +1:
+            # Body rectangle then right-pointing head
+            body_end = e - head_len
+            verts = [
+                (s, y_center - arrow_h),
+                (body_end, y_center - arrow_h),
+                (body_end, y_center - arrow_h * 1.6),
+                (e, y_center),
+                (body_end, y_center + arrow_h * 1.6),
+                (body_end, y_center + arrow_h),
+                (s, y_center + arrow_h),
+                (s, y_center - arrow_h),
+            ]
+        elif strand == -1:
+            body_start = s + head_len
+            verts = [
+                (e, y_center - arrow_h),
+                (e, y_center + arrow_h),
+                (body_start, y_center + arrow_h),
+                (body_start, y_center + arrow_h * 1.6),
+                (s, y_center),
+                (body_start, y_center - arrow_h * 1.6),
+                (body_start, y_center - arrow_h),
+                (e, y_center - arrow_h),
+            ]
+        else:
+            # Undirectional rectangle
+            verts = [
+                (s, y_center - arrow_h),
+                (e, y_center - arrow_h),
+                (e, y_center + arrow_h),
+                (s, y_center + arrow_h),
+                (s, y_center - arrow_h),
+            ]
+
+        from matplotlib.patches import Polygon
+        patch = Polygon(verts, closed=True, facecolor=colour,
+                        edgecolor="black", linewidth=0.5, zorder=5)
+        ax.add_patch(patch)
+
+
+def _build_plot(classified: list[dict], seq_length: int, title: str) -> plt.Figure:
+    """Build a multi-track matplotlib figure.
+
+    IRs are drawn as small arrow patches directly above the CDS
+    backbone line (no separate subplot), so they sit tight against
+    the annotation track.  Invertible segments go in a subplot below.
 
     No inline labels — colour legend only.
     """
-    ir_features = []
-    cds_features = []
+    ir_data = []       # dicts with start/end/strand/colour for manual drawing
+    cds_features = []  # GraphicFeature objects for dna_features_viewer
     seg_features = []
     ir_pair_numbers = set()
 
@@ -224,14 +284,11 @@ def _build_plot(classified: list[dict], seq_length: int, title: str) -> plt.Figu
         if cat == "inverted_repeat":
             pair_num = _extract_ir_pair_number(f)
             ir_pair_numbers.add(pair_num)
-            colour = _ir_pair_colour(pair_num)
-            ir_features.append(
-                GraphicFeature(
-                    start=start, end=end,
-                    strand=_strand_int(f["strand"]),
-                    color=colour, thickness=8, linewidth=0.5,
-                )
-            )
+            ir_data.append({
+                "start": start, "end": end,
+                "strand": _strand_int(f["strand"]),
+                "colour": _ir_pair_colour(pair_num),
+            })
         elif cat == "invertible_segment":
             seg_features.append(
                 GraphicFeature(
@@ -250,51 +307,45 @@ def _build_plot(classified: list[dict], seq_length: int, title: str) -> plt.Figu
                 )
             )
 
-    has_ir = len(ir_features) > 0
+    has_ir = len(ir_data) > 0
     has_seg = len(seg_features) > 0
 
-    # Build subplot layout — tight ratios to keep IR track close to CDS
-    ratios = []
-    track_keys = []
-    if has_ir:
-        ratios.append(0.35)
-        track_keys.append("ir")
-    ratios.append(1.0)
-    track_keys.append("cds")
+    # Subplot layout: CDS (+ IRs drawn on same axes), optionally segments below
+    n_panels = 1 + int(has_seg)
+    ratios = [1.0]
     if has_seg:
-        ratios.append(0.35)
-        track_keys.append("seg")
+        ratios.append(0.4)
 
     fig_width = max(12, min(20, seq_length / 250))
-    fig_height = 0.8 + 0.7 * len(ratios)
+    fig_height = 1.6 + (0.8 if has_seg else 0)
 
     fig, axes = plt.subplots(
-        len(ratios), 1,
+        n_panels, 1,
         figsize=(fig_width, fig_height),
         gridspec_kw={"height_ratios": ratios, "hspace": 0.02},
         sharex=True,
         squeeze=False,
     )
     axes = [ax for ax in axes.flat]
-    ax_map = dict(zip(track_keys, axes))
-
-    # IR track (above CDS) — single row, no stacking
-    if "ir" in ax_map:
-        rec = GraphicRecord(sequence_length=seq_length, features=ir_features)
-        ax_ir = ax_map["ir"]
-        rec.plot(ax=ax_ir, with_ruler=False, draw_line=False, annotate_inline=False)
-        # Force all features onto the same y-row (collapse stacking)
-        ax_ir.set_ylim(-1, 1)
+    ax_cds = axes[0]
 
     # CDS track (main annotation line)
     rec = GraphicRecord(sequence_length=seq_length, features=cds_features)
-    rec.plot(ax=ax_map["cds"], with_ruler=not has_seg, draw_line=True, annotate_inline=False)
-    ax_map["cds"].set_title(title, fontsize=10, loc="left", fontweight="bold")
+    rec.plot(ax=ax_cds, with_ruler=not has_seg, draw_line=True, annotate_inline=False)
+    ax_cds.set_title(title, fontsize=10, loc="left", fontweight="bold")
+
+    # Draw IR arrows directly above the CDS backbone on the same axes
+    if has_ir:
+        _draw_ir_arrows(ax_cds, ir_data, seq_length, y_center=0.55)
+        # Expand y-limits upward to make room for the IR row
+        ymin, ymax = ax_cds.get_ylim()
+        ax_cds.set_ylim(ymin, max(ymax, 0.85))
 
     # Segment track (below CDS)
-    if "seg" in ax_map:
+    if has_seg:
+        ax_seg = axes[1]
         rec = GraphicRecord(sequence_length=seq_length, features=seg_features)
-        rec.plot(ax=ax_map["seg"], with_ruler=True, draw_line=False, annotate_inline=False)
+        rec.plot(ax=ax_seg, with_ruler=True, draw_line=False, annotate_inline=False)
 
     # Legend — CDS categories + per-pair IR colours
     handles = []
