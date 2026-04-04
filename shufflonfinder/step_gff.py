@@ -3,6 +3,7 @@
 import csv
 import logging
 import os
+import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from io import StringIO
@@ -578,49 +579,139 @@ def _group_irs_by_cluster(
     return groups
 
 
+# ── Window classification helpers ────────────────────────────────────────────
+
+_IR_NAME_RE = re.compile(r"inverted_repeat_(\d+)_(FOR|REV)", re.IGNORECASE)
+
+
+def _ir_pairs_from_features(ir_features: list[Feature]) -> dict[int, dict]:
+    """Group IR features into pairs by their pair number.
+
+    Returns a dict mapping pair_number -> {"for": Feature, "rev": Feature}.
+    Only pairs with both a FOR and REV arm are included.
+    """
+    pairs: dict[int, dict] = {}
+    for ir in ir_features:
+        name = ir.name or ""
+        m = _IR_NAME_RE.search(name)
+        if not m:
+            continue
+        pair_num = int(m.group(1))
+        direction = m.group(2).upper()
+        pairs.setdefault(pair_num, {})
+        pairs[pair_num]["for" if direction == "FOR" else "rev"] = ir
+
+    # Keep only complete pairs
+    return {k: v for k, v in pairs.items() if "for" in v and "rev" in v}
+
+
+def _is_shufflon_like(ir_features: list[Feature], max_gap: int = 10) -> bool:
+    """Check whether IR features have shufflon-like organisation.
+
+    In a shufflon, sfx recognition sites occur at the boundaries between
+    invertible cassettes.  At each boundary, the REV arm of one pair and
+    the FOR arm of the next pair are immediately adjacent (within
+    ``max_gap`` bp).  This function checks that ALL consecutive pairs
+    (sorted by position) satisfy this adjacency criterion.
+
+    Requires at least 3 complete pairs.
+    """
+    pairs = _ir_pairs_from_features(ir_features)
+    if len(pairs) < 3:
+        return False
+
+    # For each pair, compute: pair_start (min coord), pair_end (max coord)
+    pair_spans = []
+    for pnum in sorted(pairs):
+        p = pairs[pnum]
+        all_coords = [p["for"].start, p["for"].end, p["rev"].start, p["rev"].end]
+        pair_spans.append((min(all_coords), max(all_coords), pnum))
+
+    # Sort by the leftmost coordinate
+    pair_spans.sort(key=lambda x: x[0])
+
+    # Check adjacency for all consecutive pairs
+    for i in range(len(pair_spans) - 1):
+        _, end_i, _ = pair_spans[i]
+        start_next, _, _ = pair_spans[i + 1]
+        gap = start_next - end_i
+        if abs(gap) > max_gap:
+            return False
+
+    return True
+
+
+def _ir_near_hmm_hit(
+    ir_features: list[Feature],
+    hmm_features: list[Feature],
+    max_distance: int = 2000,
+) -> bool:
+    """Check if at least one IR arm is within max_distance of an HMM hit."""
+    if not hmm_features:
+        return False
+    for ir in ir_features:
+        for hmm in hmm_features:
+            if ir.distance_to(hmm) <= max_distance:
+                return True
+    return False
+
+
 def extract_shufflon_windows(
     merged_gff: str,
-    output_dir: str,
+    shufflon_output_dir: str,
+    inverton_output_dir: str,
     sample_id: str = "",
     window_size: int = 3000,
     min_ir_pairs: int = 3,
-) -> list[ShufflonWindow]:
-    """Extract GFF+FASTA windows where inverted repeats co-locate with CDS features.
+    shufflon_max_gap: int = 10,
+    inverton_hmm_distance: int = 2000,
+) -> tuple[list[ShufflonWindow], list[ShufflonWindow]]:
+    """Extract and classify GFF+FASTA windows from merged annotations.
 
-    For each cluster of nearby IRs, finds overlapping CDS features and nearby
-    HMM hit features (within window_size).  The HMM hit gene that originally
-    triggered the flanking region extraction is always included and written
-    as a separate ``hmm_hit`` annotation track in the per-window GFF.
+    Each cluster of nearby IRs is classified as shufflon-like or
+    inverton-like:
 
-    Only windows with at least ``min_ir_pairs`` IR pairs are emitted.
+      * Shufflon-like — at least *min_ir_pairs* complete pairs **and**
+        every consecutive pair (sorted by position) is adjacent within
+        *shufflon_max_gap* bp (the R64 / TP114 organisation where sfx
+        sites sit at cassette boundaries in quick succession).
+
+      * Inverton-like — at least one complete IR pair within
+        *inverton_hmm_distance* bp of an HMM-hit CDS.
+
+    Windows matching neither category are skipped.
 
     Args:
-        merged_gff: Path to a merged GFF (Prokka + HMM + IR annotations, with FASTA).
-        output_dir: Where to write the per-window GFF files.
-        sample_id: Sample identifier (used in the returned ShufflonWindow objects).
-        window_size: Maximum distance (bp) to cluster IRs together.
-        min_ir_pairs: Minimum number of IR pairs required per window (default 3).
+        merged_gff: Merged GFF (Prokka + HMM + IR, with embedded FASTA).
+        shufflon_output_dir: Directory for shufflon-like window GFFs.
+        inverton_output_dir: Directory for inverton-like window GFFs.
+        sample_id: Sample identifier for ShufflonWindow objects.
+        window_size: Distance (bp) for clustering IRs / finding nearby HMM hits.
+        min_ir_pairs: Minimum IR pairs for shufflon-like classification.
+        shufflon_max_gap: Maximum gap (bp) between consecutive pair spans
+            for shufflon-like adjacency.
+        inverton_hmm_distance: Maximum distance (bp) from any IR arm to an
+            HMM hit for inverton-like classification.
 
     Returns:
-        List of ShufflonWindow objects (one per extracted window).
+        ``(shufflon_windows, inverton_windows)`` — each a list of
+        :class:`ShufflonWindow`.
     """
-    ensure_dir(output_dir)
+    ensure_dir(shufflon_output_dir)
+    ensure_dir(inverton_output_dir)
     input_prefix = os.path.splitext(os.path.basename(merged_gff))[0]
 
     ir_by_contig, cds_by_contig, hmm_by_contig, sequences = parse_gff_with_fasta(merged_gff)
 
     if not sequences:
         logger.warning("No FASTA sequences found in %s", merged_gff)
-        return []
+        return [], []
 
-    windows = []
+    shufflon_windows: list[ShufflonWindow] = []
+    inverton_windows: list[ShufflonWindow] = []
     window_counter = defaultdict(int)
 
     for contig_id, ir_features in ir_by_contig.items():
-        # Group IRs by cluster_id if available, otherwise fall back to
-        # proximity-based grouping.  Cluster-based grouping keeps
-        # distinct shufflon candidate clusters as separate windows even
-        # when they are close together on the same contig.
         ir_groups = _group_irs_by_cluster(ir_features, window_size)
         contig_cds = cds_by_contig.get(contig_id, [])
         contig_hmm = hmm_by_contig.get(contig_id, [])
@@ -628,26 +719,41 @@ def extract_shufflon_windows(
         seq_len = len(seq)
 
         for ir_group in ir_groups:
-            # Enforce minimum IR pair count per window
-            n_ir_in_group = len(ir_group) // 2
-            if n_ir_in_group < min_ir_pairs:
+            n_ir_pairs = len(ir_group) // 2
+            if n_ir_pairs < 1:
+                continue
+
+            # ── Classify ────────────────────────────────────────────
+            nearby_hmm = _find_nearby_hmm_hits(ir_group, contig_hmm, window_size)
+
+            is_shufflon = (
+                n_ir_pairs >= min_ir_pairs
+                and _is_shufflon_like(ir_group, max_gap=shufflon_max_gap)
+            )
+
+            if is_shufflon:
+                category = "shufflon_like"
+                output_dir = shufflon_output_dir
+            elif _ir_near_hmm_hit(ir_group, contig_hmm, max_distance=inverton_hmm_distance):
+                category = "inverton_like"
+                output_dir = inverton_output_dir
+            else:
                 logger.debug(
-                    "Skipping IR group on %s with %d pair(s) (min %d)",
-                    contig_id, n_ir_in_group, min_ir_pairs,
+                    "IR group on %s (%d pairs) matches neither shufflon nor inverton criteria, skipping",
+                    contig_id, n_ir_pairs,
                 )
                 continue
 
+            # ── Build window ────────────────────────────────────────
             intersecting_cds = find_intersecting_cds(ir_group, contig_cds)
-            nearby_hmm = _find_nearby_hmm_hits(ir_group, contig_hmm, window_size)
 
-            # A window must have at least CDS or HMM hit features
             if not intersecting_cds and not nearby_hmm:
                 continue
 
             window_counter[contig_id] += 1
             wnum = window_counter[contig_id]
 
-            # Calculate window bounds including all feature types
+            # Window bounds encompassing all feature types
             all_starts = [ir.start for ir in ir_group]
             all_ends = [ir.end for ir in ir_group]
             for c in intersecting_cds:
@@ -663,12 +769,9 @@ def extract_shufflon_windows(
             if win_start >= win_end:
                 continue
 
-            # Collect any CDS that fall within the (possibly expanded) window
-            # bounds, since HMM hit inclusion may have widened it
+            # Re-collect CDS within the (possibly expanded) window
             win_span = Feature(contig_id, ".", "window", win_start, win_end, "+", "")
-            intersecting_cds = [
-                c for c in contig_cds if win_span.overlaps(c)
-            ]
+            intersecting_cds = [c for c in contig_cds if win_span.overlaps(c)]
 
             seq_id = f"{input_prefix}_{contig_id}_{wnum}"
             window_id = f"{sample_id}_{contig_id}_w{wnum}" if sample_id else seq_id
@@ -677,13 +780,12 @@ def extract_shufflon_windows(
                 f"{input_prefix}_contig_{contig_id}_window_{wnum}.gff",
             )
 
-            # Find invertible cassettes from IR pairs
             cassettes = _find_invertible_cassettes(ir_group)
 
+            # ── Write per-window GFF ────────────────────────────────
             with open(out_path, "w") as fh:
                 fh.write("##gff-version 3\n")
 
-                # Track 1: inverted repeats
                 for ir in ir_group:
                     ir_source = ir.source if ir.source else "einverted"
                     fh.write(
@@ -692,7 +794,6 @@ def extract_shufflon_windows(
                         f"{ir.strand}\t.\t{ir.attributes}\n"
                     )
 
-                # Track 2: HMM hits
                 for hmm in nearby_hmm:
                     fh.write(
                         f"{seq_id}\tshufflonfinder\thmm_hit\t"
@@ -700,7 +801,6 @@ def extract_shufflon_windows(
                         f"{hmm.strand}\t.\t{hmm.attributes}\n"
                     )
 
-                # Track 3: CDS features (from Prokka)
                 for cds in intersecting_cds:
                     fh.write(
                         f"{seq_id}\t{cds.source}\tCDS\t"
@@ -708,7 +808,6 @@ def extract_shufflon_windows(
                         f"{cds.strand}\t.\t{cds.attributes}\n"
                     )
 
-                # Track 4: invertible cassettes (DNA spanning IR pairs)
                 for si, (seg_s, seg_e) in enumerate(cassettes, start=1):
                     local_s = seg_s - win_start + 1
                     local_e = seg_e - win_start
@@ -723,8 +822,6 @@ def extract_shufflon_windows(
                 fh.write("##FASTA\n")
                 fh.write(f">{seq_id}\n{seq[win_start:win_end]}\n")
 
-            n_ir_pairs = len(ir_group) // 2
-
             win = ShufflonWindow(
                 sample_id=sample_id,
                 window_id=window_id,
@@ -737,12 +834,17 @@ def extract_shufflon_windows(
                 hmm_hit_features=list(nearby_hmm),
                 gff_path=out_path,
             )
-            windows.append(win)
+
+            if category == "shufflon_like":
+                shufflon_windows.append(win)
+            else:
+                inverton_windows.append(win)
 
     logger.info(
-        "Extracted %d shufflon windows from %s", len(windows), merged_gff
+        "Extracted %d shufflon-like + %d inverton-like windows from %s",
+        len(shufflon_windows), len(inverton_windows), merged_gff,
     )
-    return windows
+    return shufflon_windows, inverton_windows
 
 
 def shufflon_windows_to_tsv(
