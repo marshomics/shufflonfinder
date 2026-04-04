@@ -767,9 +767,41 @@ def refine_sfx_sites(
         region_end = min(len(seq), max(all_coords) + search_margin)
         region_seq = seq[region_start:region_end].upper()
 
-        # Collect existing arm spans to avoid duplicates
-        existing_spans = set()
+        # Identify "extended" IR pairs whose arms bridge inner boundaries
+        # (spanning from one sfx site into an adjacent one).  These are
+        # einverted artifacts from matching long stretches that include
+        # parts of two neighbouring sites.  Detection: any pair whose
+        # BOTH arms exceed 1.5× the median arm length is likely extended.
+        # We require 3+ pairs to have a meaningful median.
+        import statistics
+        all_arm_lens = []
         for _, row in cluster.iterrows():
+            all_arm_lens.append(int(row["LeftIRStop"]) - int(row["LeftIRStart"]))
+            all_arm_lens.append(int(row["RightIRStop"]) - int(row["RightIRStart"]))
+        median_arm = statistics.median(all_arm_lens) if all_arm_lens else 0
+
+        extended_indices = set()
+        if len(cluster) >= 3 and median_arm > 0:
+            for idx, row in cluster.iterrows():
+                l_len = int(row["LeftIRStop"]) - int(row["LeftIRStart"])
+                r_len = int(row["RightIRStop"]) - int(row["RightIRStart"])
+                if l_len > median_arm * 1.4 and r_len > median_arm * 1.4:
+                    extended_indices.add(idx)
+
+        if extended_indices:
+            logger.info(
+                "Cluster %s: removing %d extended IR pair(s) that bridge "
+                "inner boundaries (arm ratio > 1.4× median %dbp)",
+                cluster_id, len(extended_indices), median_arm,
+            )
+
+        # Build existing_spans from non-extended pairs only.
+        # This allows the motif search to find individual sites within
+        # regions previously covered by extended arms.
+        existing_spans = set()
+        for idx, row in cluster.iterrows():
+            if idx in extended_indices:
+                continue
             existing_spans.add((int(row["LeftIRStart"]), int(row["LeftIRStop"])))
             existing_spans.add((int(row["RightIRStart"]), int(row["RightIRStop"])))
 
@@ -793,11 +825,18 @@ def refine_sfx_sites(
 
         # Compute typical individual sfx site length from detected arms.
         # einverted arms may span two abutting sites, so use the MINIMUM
-        # arm length as the best estimate for single-site width.
+        # arm length from NON-EXTENDED arms as the best estimate for
+        # single-site width.
         arm_lengths = []
-        for _, row in cluster.iterrows():
+        for idx, row in cluster.iterrows():
+            if idx in extended_indices:
+                continue
             arm_lengths.append(int(row["LeftIRStop"]) - int(row["LeftIRStart"]))
             arm_lengths.append(int(row["RightIRStop"]) - int(row["RightIRStart"]))
+        if not arm_lengths:
+            # All pairs are extended; fall back to core length + 6
+            # (typical sfx site is core + 6bp extension)
+            arm_lengths = [len(core) + 6]
         site_len = min(arm_lengths)
 
         # Collect existing R-arm RCs and F-arm sequences for partner matching.
@@ -938,14 +977,47 @@ def refine_sfx_sites(
                 best_identity,
             )
 
-    if not new_rows:
-        logger.info("Motif refinement: no additional sfx sites found")
+    # Remove extended pairs that bridge inner boundaries.
+    # Re-detect using the same median-ratio logic applied per-cluster above.
+    import statistics
+    all_extended = set()
+    for cluster_id, cluster in ir_df.groupby("cluster_id"):
+        if len(cluster) < 3:
+            continue
+        arm_lens = []
+        for _, row in cluster.iterrows():
+            arm_lens.append(int(row["LeftIRStop"]) - int(row["LeftIRStart"]))
+            arm_lens.append(int(row["RightIRStop"]) - int(row["RightIRStart"]))
+        med_a = statistics.median(arm_lens) if arm_lens else 0
+        if med_a <= 0:
+            continue
+        for idx, row in cluster.iterrows():
+            l_len = int(row["LeftIRStop"]) - int(row["LeftIRStart"])
+            r_len = int(row["RightIRStop"]) - int(row["RightIRStart"])
+            if l_len > med_a * 1.4 and r_len > med_a * 1.4:
+                all_extended.add(idx)
+
+    # Drop extended pairs from the original DataFrame
+    if all_extended:
+        ir_df = ir_df.drop(index=all_extended).reset_index(drop=True)
+        logger.info(
+            "Motif refinement: removed %d extended IR pair(s)",
+            len(all_extended),
+        )
+
+    if not new_rows and not all_extended:
+        logger.info("Motif refinement: no changes")
         return ir_df
 
-    new_df = pd.DataFrame(new_rows)
-    result = pd.concat([ir_df, new_df], ignore_index=True)
+    if new_rows:
+        new_df = pd.DataFrame(new_rows)
+        result = pd.concat([ir_df, new_df], ignore_index=True)
+    else:
+        result = ir_df
+
     logger.info(
-        "Motif refinement: added %d sfx sites (%d -> %d IR entries)",
-        len(new_rows), len(ir_df), len(result),
+        "Motif refinement: %d extended pairs removed, %d sites added "
+        "(%d IR entries total)",
+        len(all_extended), len(new_rows), len(result),
     )
     return result
