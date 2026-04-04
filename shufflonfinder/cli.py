@@ -236,6 +236,7 @@ def main(argv=None):
     # Shared resources (HMM profiles) stay at outdir level.
     def sample_dirs(sample_id: str) -> dict[str, str]:
         root = ensure_dir(os.path.join(outdir, sample_id))
+        win_root = os.path.join(root, "07_shufflon_windows")
         return {
             "root":         root,
             "prokka":       ensure_dir(os.path.join(root, "01_prokka")),
@@ -247,9 +248,11 @@ def main(argv=None):
             "gff_hmm":      ensure_dir(os.path.join(root, "06_gff", "hmm_hits")),
             "gff_ir":       ensure_dir(os.path.join(root, "06_gff", "ir")),
             "gff_merged":   ensure_dir(os.path.join(root, "06_gff", "merged")),
-            "windows":      ensure_dir(os.path.join(root, "07_shufflon_windows")),
-            "window_gffs":  ensure_dir(os.path.join(root, "07_shufflon_windows", "gffs")),
-            "plots":        ensure_dir(os.path.join(root, "07_shufflon_windows", "plots")),
+            "windows":      ensure_dir(win_root),
+            "shufflon_gffs":  ensure_dir(os.path.join(win_root, "shufflon_like", "gffs")),
+            "shufflon_plots": ensure_dir(os.path.join(win_root, "shufflon_like", "plots")),
+            "inverton_gffs":  ensure_dir(os.path.join(win_root, "inverton_like", "gffs")),
+            "inverton_plots": ensure_dir(os.path.join(win_root, "inverton_like", "plots")),
         }
 
     # Build dirs for each sample up front
@@ -379,6 +382,11 @@ def main(argv=None):
     logger.info("STEP 5: Shufflon candidate filtering")
     logger.info("=" * 60)
 
+    # Keep a copy of all quality-filtered IRs before the strict shufflon
+    # filter.  IRs that don't pass the shufflon criteria are still
+    # candidates for inverton-like classification in step 7.
+    quality_ir_df = ir_df.copy() if not ir_df.empty else ir_df
+
     ir_df = filter_shufflon_candidates(
         ir_df,
         samples,
@@ -403,6 +411,37 @@ def main(argv=None):
         group.to_csv(cand_path, sep="\t", index=False)
     logger.info("Shufflon candidate IRs: %d records", len(ir_df))
 
+    # Inverton candidates: quality-filtered IRs NOT in shufflon clusters.
+    # These lack a cluster_id in the GFF, so extract_shufflon_windows
+    # will group them by proximity and apply inverton-specific criteria.
+    shufflon_ir_df = ir_df
+    if not shufflon_ir_df.empty and not quality_ir_df.empty:
+        shufflon_keys = set(zip(
+            shufflon_ir_df["sample_id"],
+            shufflon_ir_df["IR_Chr"],
+            shufflon_ir_df["LeftIRStart"],
+            shufflon_ir_df["RightIRStart"],
+        ))
+        quality_keys = list(zip(
+            quality_ir_df["sample_id"],
+            quality_ir_df["IR_Chr"],
+            quality_ir_df["LeftIRStart"],
+            quality_ir_df["RightIRStart"],
+        ))
+        inverton_mask = [k not in shufflon_keys for k in quality_keys]
+        inverton_ir_df = quality_ir_df[inverton_mask].copy()
+    else:
+        inverton_ir_df = quality_ir_df.copy() if not quality_ir_df.empty else pd.DataFrame()
+
+    logger.info("Inverton candidate IRs: %d records", len(inverton_ir_df))
+
+    # Combined IR DataFrame for GFF generation (shufflon IRs carry
+    # cluster_id; inverton IRs do not — this distinction drives the
+    # classification logic in extract_shufflon_windows).
+    combined_ir_df = pd.concat(
+        [shufflon_ir_df, inverton_ir_df], ignore_index=True,
+    ) if not shufflon_ir_df.empty or not inverton_ir_df.empty else pd.DataFrame()
+
     # ==================================================================
     # Step 6: Generate and merge GFF files
     # ==================================================================
@@ -417,8 +456,8 @@ def main(argv=None):
         sample_hits = hmm_hits_df[hmm_hits_df["genome"] == sample.sample_id] if not hmm_hits_df.empty else hmm_hits_df
         hmm_gff_map = hmm_hits_to_gff(sample_hits, [sample], sd["gff_hmm"])
 
-        # IR GFF
-        sample_irs = ir_df[ir_df["sample_id"] == sample.sample_id] if not ir_df.empty else ir_df
+        # IR GFF (both shufflon + inverton candidates)
+        sample_irs = combined_ir_df[combined_ir_df["sample_id"] == sample.sample_id] if not combined_ir_df.empty else combined_ir_df
         ir_gff_map = ir_to_gff(sample_irs, sd["gff_ir"])
 
         # Merge into Prokka GFF
@@ -438,7 +477,8 @@ def main(argv=None):
     logger.info("STEP 7: Extracting shufflon windows")
     logger.info("=" * 60)
 
-    all_windows = []
+    all_shufflon_windows = []
+    all_inverton_windows = []
     for sample in samples:
         sd = sdirs[sample.sample_id]
         merged_gff = os.path.join(sd["gff_merged"], f"{sample.sample_id}.gff")
@@ -446,18 +486,28 @@ def main(argv=None):
             logger.warning("No merged GFF for %s, skipping window extraction", sample.sample_id)
             continue
 
-        windows = extract_shufflon_windows(
+        shuf_wins, inv_wins = extract_shufflon_windows(
             merged_gff,
-            sd["window_gffs"],
+            sd["shufflon_gffs"],
+            sd["inverton_gffs"],
             sample_id=sample.sample_id,
             window_size=args.window_size,
             min_ir_pairs=args.min_ir_pairs,
         )
-        all_windows.extend(windows)
+        all_shufflon_windows.extend(shuf_wins)
+        all_inverton_windows.extend(inv_wins)
 
         # Summary per sample
-        summary_path = os.path.join(sd["windows"], "shufflon_windows_summary.tsv")
-        shufflon_windows_to_tsv(windows, summary_path)
+        if shuf_wins:
+            shufflon_windows_to_tsv(
+                shuf_wins,
+                os.path.join(sd["windows"], "shufflon_like_summary.tsv"),
+            )
+        if inv_wins:
+            shufflon_windows_to_tsv(
+                inv_wins,
+                os.path.join(sd["windows"], "inverton_like_summary.tsv"),
+            )
 
     # ==================================================================
     # Step 8: Generate shufflon plots
@@ -469,7 +519,8 @@ def main(argv=None):
     total_plots = 0
     for sample in samples:
         sd = sdirs[sample.sample_id]
-        plot_files = generate_shufflon_plots(sd["window_gffs"], sd["plots"])
+        plot_files = generate_shufflon_plots(sd["shufflon_gffs"], sd["shufflon_plots"])
+        plot_files += generate_shufflon_plots(sd["inverton_gffs"], sd["inverton_plots"])
         total_plots += len(plot_files)
     logger.info("Generated %d plot file(s)", total_plots)
 
@@ -483,8 +534,10 @@ def main(argv=None):
     logger.info("HMM profiles searched: %d", len(profiles))
     logger.info("HMM hits (filtered):   %d", len(hmm_hits_df))
     logger.info("Flanking regions:      %d", len(all_flanking_flat))
-    logger.info("Inverted repeats:      %d", len(ir_df))
-    logger.info("Shufflon windows:      %d", len(all_windows))
+    logger.info("Shufflon candidate IRs:%d", len(shufflon_ir_df))
+    logger.info("Inverton candidate IRs:%d", len(inverton_ir_df))
+    logger.info("Shufflon-like windows: %d", len(all_shufflon_windows))
+    logger.info("Inverton-like windows: %d", len(all_inverton_windows))
     logger.info("Results in:            %s", outdir)
 
     # Clean up temporary HMM profile directory
