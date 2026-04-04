@@ -65,8 +65,7 @@ def hmm_hits_to_gff(
 
         cds_map = parse_cds_from_gff(sample.gff_path)
 
-        sample_dir = ensure_dir(os.path.join(output_dir, sample_id))
-        gff_path = os.path.join(sample_dir, f"{sample_id}_hmm_hits.gff")
+        gff_path = os.path.join(output_dir, f"{sample_id}_hmm_hits.gff")
         written = 0
         seen = set()
         with open(gff_path, "w") as fh:
@@ -134,8 +133,7 @@ def ir_to_gff(ir_df: pd.DataFrame, output_dir: str) -> dict[str, str]:
 
     grouped = ir_df.groupby("sample_id")
     for sample_id, group in grouped:
-        sample_dir = ensure_dir(os.path.join(output_dir, sample_id))
-        gff_path = os.path.join(sample_dir, f"{sample_id}_ir.gff")
+        gff_path = os.path.join(output_dir, f"{sample_id}_ir.gff")
         with open(gff_path, "w", newline="") as fh:
             writer = csv.writer(fh, delimiter="\t")
             for counter, (_, row) in enumerate(group.iterrows(), start=1):
