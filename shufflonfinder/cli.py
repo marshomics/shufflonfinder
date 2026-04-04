@@ -230,6 +230,7 @@ def main(argv=None):
         "gff_ir":       ensure_dir(os.path.join(outdir, "06_gff", "ir")),
         "gff_merged":   ensure_dir(os.path.join(outdir, "06_gff", "merged")),
         "windows":      ensure_dir(os.path.join(outdir, "07_shufflon_windows")),
+        "window_gffs":  ensure_dir(os.path.join(outdir, "07_shufflon_windows", "gffs")),
         "plots":        ensure_dir(os.path.join(outdir, "07_shufflon_windows", "plots")),
     }
 
@@ -387,7 +388,8 @@ def main(argv=None):
         if sample.sample_id in ir_gff_map:
             extra_gffs.append(ir_gff_map[sample.sample_id])
 
-        merged_path = os.path.join(dirs["gff_merged"], f"{sample.sample_id}.gff")
+        merged_sample_dir = ensure_dir(os.path.join(dirs["gff_merged"], sample.sample_id))
+        merged_path = os.path.join(merged_sample_dir, f"{sample.sample_id}.gff")
         merge_gff_into_prokka(sample.gff_path, extra_gffs, merged_path)
 
     # ==================================================================
@@ -399,14 +401,14 @@ def main(argv=None):
 
     all_windows = []
     for sample in samples:
-        merged_gff = os.path.join(dirs["gff_merged"], f"{sample.sample_id}.gff")
+        merged_gff = os.path.join(dirs["gff_merged"], sample.sample_id, f"{sample.sample_id}.gff")
         if not os.path.isfile(merged_gff):
             logger.warning("No merged GFF for %s, skipping window extraction", sample.sample_id)
             continue
 
         windows = extract_shufflon_windows(
             merged_gff,
-            os.path.join(dirs["windows"], sample.sample_id),
+            os.path.join(dirs["window_gffs"], sample.sample_id),
             sample_id=sample.sample_id,
             window_size=args.window_size,
         )
@@ -423,7 +425,7 @@ def main(argv=None):
     logger.info("STEP 8: Generating shufflon plots")
     logger.info("=" * 60)
 
-    plot_files = generate_shufflon_plots(dirs["windows"], dirs["plots"])
+    plot_files = generate_shufflon_plots(dirs["window_gffs"], dirs["plots"])
     logger.info("Generated %d plot file(s)", len(plot_files))
 
     # ==================================================================
