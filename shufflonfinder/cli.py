@@ -59,7 +59,7 @@ from .step_gff import (
     extract_shufflon_windows,
     shufflon_windows_to_tsv,
 )
-from .step_clinker import generate_clinker_plots
+from .step_clinker import generate_shufflon_plots
 
 logger = logging.getLogger("shufflonfinder")
 
@@ -230,7 +230,7 @@ def main(argv=None):
         "gff_ir":       ensure_dir(os.path.join(outdir, "06_gff", "ir")),
         "gff_merged":   ensure_dir(os.path.join(outdir, "06_gff", "merged")),
         "windows":      ensure_dir(os.path.join(outdir, "07_shufflon_windows")),
-        "clinker":      ensure_dir(os.path.join(outdir, "07_shufflon_windows", "clinker")),
+        "plots":        ensure_dir(os.path.join(outdir, "07_shufflon_windows", "plots")),
     }
 
     # ==================================================================
@@ -420,11 +420,11 @@ def main(argv=None):
     # Step 8: Generate Clinker plots for shufflon windows
     # ==================================================================
     logger.info("=" * 60)
-    logger.info("STEP 8: Generating Clinker plots")
+    logger.info("STEP 8: Generating shufflon plots")
     logger.info("=" * 60)
 
-    clinker_plots = generate_clinker_plots(dirs["windows"], dirs["clinker"])
-    logger.info("Generated %d Clinker plot(s)", len(clinker_plots))
+    plot_files = generate_shufflon_plots(dirs["windows"], dirs["plots"])
+    logger.info("Generated %d plot file(s)", len(plot_files))
 
     # ==================================================================
     # Summary
