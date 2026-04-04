@@ -156,11 +156,10 @@ The directory can contain `.hmm` or `.hmm.gz` files. Each file should hold one H
 
 ## Output structure
 
-Each sample gets its own top-level directory. Shared HMM profiles live at the `outdir` root.
+Each sample gets its own top-level directory.
 
 ```
 results/
-├── hmm_profiles/                              # Decompressed, hmmpress'd profiles (shared)
 └── <sample_id>/
     ├── 01_prokka/                             # Prokka outputs (when run)
     │   ├── <sample_id>.faa
