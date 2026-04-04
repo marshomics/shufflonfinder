@@ -14,17 +14,17 @@ def run_prokka(sample: Sample, outdir: str, cpus: int = 4) -> Sample:
 
     Args:
         sample: A Sample whose fna_path is set.
-        outdir: Base output directory. Prokka writes to outdir/<sample_id>/.
+        outdir: Directory for Prokka output files.
         cpus: Number of threads for Prokka.
 
     Returns:
         The same Sample object with faa_path and gff_path populated.
     """
-    sample_dir = ensure_dir(os.path.join(outdir, sample.sample_id))
+    ensure_dir(outdir)
 
     cmd = [
         "prokka",
-        "--outdir", sample_dir,
+        "--outdir", outdir,
         "--prefix", sample.sample_id,
         "--cpus", str(cpus),
         "--force",
@@ -33,9 +33,9 @@ def run_prokka(sample: Sample, outdir: str, cpus: int = 4) -> Sample:
     ]
     run_cmd(cmd, description=f"Prokka: {sample.sample_id}")
 
-    sample.faa_path = os.path.join(sample_dir, f"{sample.sample_id}.faa")
-    sample.gff_path = os.path.join(sample_dir, f"{sample.sample_id}.gff")
-    sample.fna_path = os.path.join(sample_dir, f"{sample.sample_id}.fna")
+    sample.faa_path = os.path.join(outdir, f"{sample.sample_id}.faa")
+    sample.gff_path = os.path.join(outdir, f"{sample.sample_id}.gff")
+    sample.fna_path = os.path.join(outdir, f"{sample.sample_id}.fna")
     sample.needs_prokka = False
 
     # Verify outputs exist
