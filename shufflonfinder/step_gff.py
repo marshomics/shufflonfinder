@@ -583,6 +583,7 @@ def extract_shufflon_windows(
     output_dir: str,
     sample_id: str = "",
     window_size: int = 3000,
+    min_ir_pairs: int = 3,
 ) -> list[ShufflonWindow]:
     """Extract GFF+FASTA windows where inverted repeats co-locate with CDS features.
 
@@ -591,11 +592,14 @@ def extract_shufflon_windows(
     triggered the flanking region extraction is always included and written
     as a separate ``hmm_hit`` annotation track in the per-window GFF.
 
+    Only windows with at least ``min_ir_pairs`` IR pairs are emitted.
+
     Args:
         merged_gff: Path to a merged GFF (Prokka + HMM + IR annotations, with FASTA).
         output_dir: Where to write the per-window GFF files.
         sample_id: Sample identifier (used in the returned ShufflonWindow objects).
         window_size: Maximum distance (bp) to cluster IRs together.
+        min_ir_pairs: Minimum number of IR pairs required per window (default 3).
 
     Returns:
         List of ShufflonWindow objects (one per extracted window).
@@ -624,6 +628,15 @@ def extract_shufflon_windows(
         seq_len = len(seq)
 
         for ir_group in ir_groups:
+            # Enforce minimum IR pair count per window
+            n_ir_in_group = len(ir_group) // 2
+            if n_ir_in_group < min_ir_pairs:
+                logger.debug(
+                    "Skipping IR group on %s with %d pair(s) (min %d)",
+                    contig_id, n_ir_in_group, min_ir_pairs,
+                )
+                continue
+
             intersecting_cds = find_intersecting_cds(ir_group, contig_cds)
             nearby_hmm = _find_nearby_hmm_hits(ir_group, contig_hmm, window_size)
 
