@@ -875,29 +875,22 @@ def refine_sfx_sites(
         if not found_sites:
             continue
 
-        # For each new site, find the best-matching existing arm to pair with.
-        # The new site becomes the F or R arm of a new IR entry.
+        # For each new site, compute identity against existing arms to
+        # confirm it is a genuine sfx recognition site.  The site is stored
+        # as an *unpaired* recognition site (not duplicating an existing
+        # arm) because cross-type sfx pairings do not map 1:1 onto a
+        # single partner arm.
         template_row = cluster.iloc[0].copy()
 
         for site_start, site_end, strand, site_seq in found_sites:
-            # Find best partner: an existing arm on the opposite strand
-            # whose reverse complement best matches this site
-            best_partner = None
             best_identity = 0.0
 
             for _, row in cluster.iterrows():
                 if strand == "+":
-                    # New F site — look for existing R arms to pair with
                     partner_seq = str(row["RightIRSequence"])
-                    partner_start = int(row["RightIRStart"])
-                    partner_end = int(row["RightIRStop"])
                 else:
-                    # New R site — look for existing F arms to pair with
                     partner_seq = str(row["LeftIRSequence"])
-                    partner_start = int(row["LeftIRStart"])
-                    partner_end = int(row["LeftIRStop"])
 
-                # Compute identity: site_seq vs RC of partner_seq
                 rc_partner = _reverse_complement(partner_seq)
                 minlen = min(len(site_seq), len(rc_partner))
                 if minlen == 0:
@@ -909,38 +902,38 @@ def refine_sfx_sites(
                 identity = (matches / minlen) * 100.0
                 if identity > best_identity:
                     best_identity = identity
-                    best_partner = (partner_start, partner_end, partner_seq)
 
-            if best_partner is None or best_identity < 70.0:
+            if best_identity < 70.0:
                 continue
 
-            partner_start, partner_end, partner_seq = best_partner
-
-            # Create new IR row
+            # Store as unpaired recognition site.
+            # F-sites go in Left columns, R-sites in Right columns;
+            # the opposite side is left empty.
             new_row = template_row.copy()
             if strand == "+":
                 new_row["LeftIRStart"] = site_start
                 new_row["LeftIRStop"] = site_end
                 new_row["LeftIRSequence"] = site_seq
-                new_row["RightIRStart"] = partner_start
-                new_row["RightIRStop"] = partner_end
-                new_row["RightIRSequence"] = partner_seq
-                new_row["InvertibleSequence"] = seq[site_end:partner_start]
+                new_row["RightIRStart"] = pd.NA
+                new_row["RightIRStop"] = pd.NA
+                new_row["RightIRSequence"] = ""
+                new_row["InvertibleSequence"] = ""
             else:
-                new_row["LeftIRStart"] = partner_start
-                new_row["LeftIRStop"] = partner_end
-                new_row["LeftIRSequence"] = partner_seq
+                new_row["LeftIRStart"] = pd.NA
+                new_row["LeftIRStop"] = pd.NA
+                new_row["LeftIRSequence"] = ""
                 new_row["RightIRStart"] = site_start
                 new_row["RightIRStop"] = site_end
                 new_row["RightIRSequence"] = site_seq
-                new_row["InvertibleSequence"] = seq[partner_end:site_start]
+                new_row["InvertibleSequence"] = ""
 
             new_row["PercentIdentity"] = round(best_identity, 2)
+            new_row["unpaired_site"] = True
             new_rows.append(new_row)
 
             logger.info(
-                "Cluster %s: motif refinement found sfx site at %s:%d-%d (%s) "
-                "with %.1f%% identity to partner",
+                "Cluster %s: motif refinement found unpaired sfx site at "
+                "%s:%d-%d (%s) with %.1f%% identity to nearest arm",
                 cluster_id, contig, site_start + 1, site_end, strand,
                 best_identity,
             )
