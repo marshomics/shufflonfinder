@@ -609,10 +609,12 @@ def _is_shufflon_like(ir_features: list[Feature], max_gap: int = 10) -> bool:
     """Check whether IR features have shufflon-like organisation.
 
     In a shufflon, sfx recognition sites occur at the boundaries between
-    invertible cassettes.  At each boundary, the REV arm of one pair and
-    the FOR arm of the next pair are immediately adjacent (within
-    ``max_gap`` bp).  This function checks that ALL consecutive pairs
-    (sorted by position) satisfy this adjacency criterion.
+    invertible cassettes.  At each boundary, the end of one IR arm and
+    the start of the next are immediately adjacent (within ``max_gap``
+    bp).  This function scans ALL IR arms in the group (including
+    unpaired sites from motif refinement) for these boundary clusters
+    and requires at least two distinct boundaries, which is the minimum
+    for a three-cassette shufflon.
 
     Requires at least 3 complete pairs.
     """
@@ -620,25 +622,30 @@ def _is_shufflon_like(ir_features: list[Feature], max_gap: int = 10) -> bool:
     if len(pairs) < 3:
         return False
 
-    # For each pair, compute: pair_start (min coord), pair_end (max coord)
-    pair_spans = []
-    for pnum in sorted(pairs):
-        p = pairs[pnum]
-        all_coords = [p["for"].start, p["for"].end, p["rev"].start, p["rev"].end]
-        pair_spans.append((min(all_coords), max(all_coords), pnum))
+    # Sort all IR arms (including unpaired) by start position.
+    # Using every arm rather than just complete-pair spans means
+    # unpaired recognition sites discovered by motif search still
+    # contribute to boundary detection.
+    arms = sorted(ir_features, key=lambda f: f.start)
 
-    # Sort by the leftmost coordinate
-    pair_spans.sort(key=lambda x: x[0])
+    # Scan for boundary clusters: positions where the end of one arm
+    # and the start of the next are within max_gap.  Adjacent arms
+    # that are part of the same boundary cluster are counted once.
+    boundaries = 0
+    i = 0
+    while i < len(arms) - 1:
+        gap = arms[i + 1].start - arms[i].end
+        if abs(gap) <= max_gap:
+            boundaries += 1
+            # Skip past all arms belonging to this boundary cluster
+            while (
+                i < len(arms) - 1
+                and abs(arms[i + 1].start - arms[i].end) <= max_gap
+            ):
+                i += 1
+        i += 1
 
-    # Check adjacency for all consecutive pairs
-    for i in range(len(pair_spans) - 1):
-        _, end_i, _ = pair_spans[i]
-        start_next, _, _ = pair_spans[i + 1]
-        gap = start_next - end_i
-        if abs(gap) > max_gap:
-            return False
-
-    return True
+    return boundaries >= 2
 
 
 def _ir_near_hmm_hit(
