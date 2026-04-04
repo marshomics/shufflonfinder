@@ -571,7 +571,7 @@ def filter_shufflon_candidates(
     samples: list[Sample],
     cluster_distance: int = 1000,
     min_ir_pairs: int = 3,
-    min_ir_density: float = 2.0,
+    min_ir_density: float = 1.0,
     window_size: int = 3000,
 ) -> pd.DataFrame:
     """Filter IRs to keep only dense, shufflon-like clusters.
