@@ -564,30 +564,38 @@ def _deduplicate_ir_by_coords(ir_df: pd.DataFrame) -> pd.DataFrame:
 
     before = len(ir_df)
 
-    def _merge_group(group: pd.DataFrame) -> pd.Series:
-        """Collapse duplicate rows into one, merging metadata."""
-        row = group.iloc[0].copy()
-        if "hmm_profiles" in group.columns:
+    # Merge metadata fields for duplicate groups, then recombine
+    # with coordinate columns to avoid groupby index issues.
+    meta_merge = {"hmm_profiles": [], "locus_tag": [], "hit_id": []}
+    keep_rows = []
+
+    for _key, group in ir_df.groupby(coord_cols, sort=False):
+        # Keep the first row as the representative
+        rep = group.index[0]
+        keep_rows.append(rep)
+
+        # Merge metadata from all duplicates
+        if "hmm_profiles" in ir_df.columns:
             all_profiles = set()
             for val in group["hmm_profiles"].dropna():
                 for p in str(val).split(";"):
                     p = p.strip()
                     if p:
                         all_profiles.add(p)
-            row["hmm_profiles"] = ";".join(sorted(all_profiles))
-        if "locus_tag" in group.columns:
+            meta_merge["hmm_profiles"].append(";".join(sorted(all_profiles)))
+        if "locus_tag" in ir_df.columns:
             tags = sorted(set(group["locus_tag"].dropna().astype(str)))
-            row["locus_tag"] = ";".join(tags)
-        if "hit_id" in group.columns:
+            meta_merge["locus_tag"].append(";".join(tags))
+        if "hit_id" in ir_df.columns:
             ids = sorted(set(group["hit_id"].dropna().astype(str)))
-            row["hit_id"] = ";".join(ids)
-        return row
+            meta_merge["hit_id"].append(";".join(ids))
 
-    deduped = (
-        ir_df.groupby(coord_cols, sort=False)
-        .apply(_merge_group, include_groups=False)
-        .reset_index(drop=True)
-    )
+    deduped = ir_df.loc[keep_rows].copy().reset_index(drop=True)
+
+    # Overwrite merged metadata columns
+    for col in ("hmm_profiles", "locus_tag", "hit_id"):
+        if col in deduped.columns and meta_merge[col]:
+            deduped[col] = meta_merge[col]
 
     removed = before - len(deduped)
     if removed:
