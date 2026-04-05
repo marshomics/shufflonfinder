@@ -28,6 +28,7 @@ import os
 import shutil
 import sys
 import tempfile
+from collections import defaultdict
 
 import pandas as pd
 
@@ -65,6 +66,8 @@ from .step_gff import (
     shufflon_windows_to_tsv,
 )
 from .step_clinker import generate_shufflon_plots
+from .step_kofamscan import run_kofamscan, load_ko_table
+from .step_kegg_enrichment import run_kegg_enrichment_for_sample
 
 logger = logging.getLogger("shufflonfinder")
 
@@ -177,6 +180,19 @@ def parse_args(argv=None):
         help="Skip Prokka even for FASTA inputs (implies .faa/.gff exist alongside .fna).",
     )
     p.add_argument(
+        "--ko-profiles-dir",
+        default=None,
+        help="Path to the KOfamscan profile directory (must contain "
+             "profiles/ and ko_list). When provided, KOfamscan is run "
+             "on each sample's .faa to assign KO accessions, and KEGG "
+             "enrichment analysis is performed on inverton-like windows.",
+    )
+    p.add_argument(
+        "--skip-kofamscan", action="store_true",
+        help="Skip KOfamscan even when --ko-profiles-dir is set. Use this "
+             "when the sample sheet already has a kofamscan_path column.",
+    )
+    p.add_argument(
         "-v", "--verbose", action="count", default=1,
         help="Increase verbosity (-v = INFO, -vv = DEBUG).",
     )
@@ -219,6 +235,11 @@ def main(argv=None):
     if not args.sample_sheet and not args.skip_prokka:
         required_tools.append("prokka")
 
+    # KOfamscan is needed when ko_profiles_dir is set and we're not skipping
+    run_kofamscan_step = bool(args.ko_profiles_dir) and not args.skip_kofamscan
+    if run_kofamscan_step:
+        required_tools.append("exec_annotation")
+
     for tool in required_tools:
         check_tool(tool)
 
@@ -253,6 +274,8 @@ def main(argv=None):
             "shufflon_plots": ensure_dir(os.path.join(win_root, "shufflon_like", "plots")),
             "inverton_gffs":  ensure_dir(os.path.join(win_root, "inverton_like", "gffs")),
             "inverton_plots": ensure_dir(os.path.join(win_root, "inverton_like", "plots")),
+            "kofamscan":    ensure_dir(os.path.join(root, "08_kofamscan")),
+            "kegg_enrich":  ensure_dir(os.path.join(root, "09_kegg_enrichment")),
         }
 
     # Build dirs for each sample up front
@@ -525,6 +548,92 @@ def main(argv=None):
     logger.info("Generated %d plot file(s)", total_plots)
 
     # ==================================================================
+    # Step 9: KOfamscan annotation
+    # ==================================================================
+    # Determine whether to run KOfamscan based on CLI args and sample sheet.
+    # KOfamscan runs when --ko-profiles-dir is given (and --skip-kofamscan
+    # is not set), OR is skipped entirely if every sample already has a
+    # kofamscan_path from the sample sheet.
+    has_ko_profiles_dir = bool(args.ko_profiles_dir)
+    any_sample_has_kofamscan = any(s.kofamscan_path for s in samples)
+    ko_enabled = has_ko_profiles_dir or any_sample_has_kofamscan
+
+    # Per-sample KO DataFrames
+    ko_dfs: dict[str, pd.DataFrame] = {}
+
+    if ko_enabled:
+        logger.info("=" * 60)
+        logger.info("STEP 9: KOfamscan annotation")
+        logger.info("=" * 60)
+
+        for sample in samples:
+            sd = sdirs[sample.sample_id]
+
+            # Decide where the KOfamscan output lives
+            ko_path = sample.kofamscan_path
+            if ko_path and os.path.isfile(ko_path):
+                logger.info(
+                    "Using pre-computed KOfamscan output for %s: %s",
+                    sample.sample_id, ko_path,
+                )
+            elif run_kofamscan_step:
+                ko_path = run_kofamscan(
+                    sample, sd["kofamscan"], args.ko_profiles_dir,
+                    cpus=args.cpus,
+                )
+            else:
+                logger.info(
+                    "No KOfamscan output for %s and --ko-profiles-dir not set, skipping",
+                    sample.sample_id,
+                )
+                ko_dfs[sample.sample_id] = pd.DataFrame(
+                    columns=["sample_id", "gene_id", "ko_accession", "threshold", "score", "e_value"]
+                )
+                continue
+
+            ko_dfs[sample.sample_id] = load_ko_table(sample, ko_path)
+
+        # ==================================================================
+        # Step 10: KEGG enrichment analysis
+        # ==================================================================
+        logger.info("=" * 60)
+        logger.info("STEP 10: KEGG enrichment analysis (inverton-like windows)")
+        logger.info("=" * 60)
+
+        # Build per-sample window lists
+        sample_shufflon_wins: dict[str, list] = defaultdict(list)
+        sample_inverton_wins: dict[str, list] = defaultdict(list)
+        for win in all_shufflon_windows:
+            sample_shufflon_wins[win.sample_id].append(win)
+        for win in all_inverton_windows:
+            sample_inverton_wins[win.sample_id].append(win)
+
+        for sample in samples:
+            sid = sample.sample_id
+            sd = sdirs[sid]
+            ko_df = ko_dfs.get(sid, pd.DataFrame())
+
+            if ko_df.empty:
+                logger.info("No KO data for %s, skipping enrichment", sid)
+                continue
+
+            # Background: all KO accessions in the genome
+            background_kos = set(ko_df["ko_accession"].dropna()) - {""}
+
+            s_wins = sample_shufflon_wins.get(sid, [])
+            i_wins = sample_inverton_wins.get(sid, [])
+
+            if not s_wins and not i_wins:
+                logger.info("No windows for %s, skipping enrichment", sid)
+                continue
+
+            run_kegg_enrichment_for_sample(
+                sid, s_wins, i_wins, ko_df, background_kos, sd["kegg_enrich"],
+            )
+    else:
+        logger.info("STEPS 9-10: KOfamscan / KEGG enrichment — skipped (no --ko-profiles-dir)")
+
+    # ==================================================================
     # Summary
     # ==================================================================
     logger.info("=" * 60)
@@ -538,6 +647,9 @@ def main(argv=None):
     logger.info("Inverton candidate IRs:%d", len(inverton_ir_df))
     logger.info("Shufflon-like windows: %d", len(all_shufflon_windows))
     logger.info("Inverton-like windows: %d", len(all_inverton_windows))
+    if ko_enabled:
+        total_kos = sum(len(df) for df in ko_dfs.values())
+        logger.info("KO assignments:        %d", total_kos)
     logger.info("Results in:            %s", outdir)
 
     # Clean up temporary HMM profile directory
