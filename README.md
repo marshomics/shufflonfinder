@@ -6,7 +6,6 @@
 
 Annotate shufflon structures in bacterial genomes. Searches predicted proteins against a library of HMM profiles targeting shufflon-associated recombinases (e.g. Rci), extracts flanking DNA around each hit, detects inverted repeats in those flanking regions using EMBOSS einverted, applies motif-based refinement to recover sfx recognition sites missed by pairwise alignment, filters for dense IR clusters, and produces merged GFF annotations with windowed output and gene-organisation plots for each candidate shufflon locus.
 
-
 ## How it works
 
 The pipeline runs eight steps in sequence:
@@ -34,6 +33,10 @@ The pipeline runs eight steps in sequence:
 
 9. **Plot generation** produces PNG and SVG gene-organisation figures for each window GFF (both shufflon-like and inverton-like) using [dna_features_viewer](https://github.com/Edinburgh-Genome-Foundry/DnaFeaturesViewer). Each plot has three visual tracks: inverted repeats as directional arrows above the annotation line, CDS and recombinase as directional arrows on the main line, and invertible segments as undirectional boxes below. Each IR pair gets a distinct colour (parsed from the feature name, e.g. `inverted_repeat_01_FOR`/`inverted_repeat_01_REV`), so overlapping pairs are visually distinguishable even when drawn on the same line. Other features are colour-coded by category: recombinases (red), invertible segments (orange), CDS containing inverted repeats (teal), and other CDS (grey). Identification is via legend only.
 
+10. **KOfamscan annotation** (optional, requires `--ko-profiles-dir`) runs [KOfamscan](https://github.com/takaram/kofam_scan) (`exec_annotation`) on each sample's `.faa` to assign KEGG Orthology (KO) accessions to every protein that passes the profile-specific bitscore threshold. Pre-computed KOfamscan output can be supplied via the `kofamscan_path` column in the sample sheet, in which case the run step is skipped. Both the KOfamscan *detail* and *mapper* output formats are auto-detected and parsed.
+
+11. **KEGG enrichment analysis** identifies CDS that overlap at least one inverted repeat arm within each shufflon-like or inverton-like window, maps them to their KO accessions, and produces a combined output table. For inverton-like windows, a hypergeometric test is run per-sample to find KEGG pathways and modules significantly enriched among IR-overlapping CDS relative to all KO-annotated CDS in the same genome. Results are written as TSV tables and visualised as horizontal bar plots showing `-log10(p-value) × fold-change` for each enriched term, with bar colour encoding the fold change and count annotations.
+
 
 ## Prerequisites
 
@@ -45,6 +48,10 @@ External tools (installed via conda):
 - [HMMER](http://hmmer.org/) >= 3.3
 - [EMBOSS](http://emboss.sourceforge.net/) >= 6.6 (provides `einverted`)
 
+Optional external tools (for KEGG enrichment):
+
+- [KOfamscan](https://github.com/takaram/kofam_scan) — provides `exec_annotation`. Required only when using `--ko-profiles-dir`. Follow the [KOfamscan README](https://github.com/takaram/kofam_scan#usage) to download the KO profiles and ko_list file.
+
 Python libraries (installed via pip):
 
 - Python >= 3.9
@@ -52,6 +59,7 @@ Python libraries (installed via pip):
 - pandas >= 1.5
 - [dna_features_viewer](https://github.com/Edinburgh-Genome-Foundry/DnaFeaturesViewer) >= 3.1
 - matplotlib >= 3.5
+- scipy >= 1.9
 
 
 ## Installation
@@ -78,6 +86,27 @@ python -c "import dna_features_viewer; print(dna_features_viewer.__version__)"
 
 The 41 HMM profiles ship with the package in `shufflonfinder/hmms/`. No additional downloads are needed.
 
+### KOfamscan setup (optional)
+
+KOfamscan is only needed if you want KO annotation and KEGG enrichment analysis. Install it and download the profile database:
+
+```bash
+# Install KOfamscan (see https://github.com/takaram/kofam_scan)
+conda install -c bioconda kofam_scan
+
+# Download KO profiles (this takes a while — ~4 GB)
+wget ftp://ftp.genome.jp/pub/db/kofam/profiles.tar.gz
+wget ftp://ftp.genome.jp/pub/db/kofam/ko_list.gz
+tar xzf profiles.tar.gz
+gunzip ko_list.gz
+
+# The resulting directory should contain profiles/ and ko_list:
+ls ko_profiles/
+# -> ko_list  profiles/
+```
+
+Then pass `--ko-profiles-dir ko_profiles/` when running shufflonfinder.
+
 
 ## Quick start
 
@@ -90,6 +119,9 @@ shufflonfinder --input-fasta genomes/ --outdir results/ --cpus 8
 
 # Pre-annotated samples (skip Prokka)
 shufflonfinder --sample-sheet samples.tsv --outdir results/
+
+# With KOfamscan and KEGG enrichment
+shufflonfinder --input-fasta genomes/ --outdir results/ --ko-profiles-dir ko_profiles/
 ```
 
 
@@ -117,6 +149,16 @@ sample_id	fna_path	faa_path	gff_path
 genome_001	/data/genome_001.fna	/data/genome_001.faa	/data/genome_001.gff
 genome_002	/data/genome_002.fna	/data/genome_002.faa	/data/genome_002.gff
 ```
+
+An optional `kofamscan_path` column lets you supply pre-computed KOfamscan results. When this column is present and a row has a path, shufflonfinder skips running KOfamscan for that sample and parses the existing output instead. Both the *detail* (`--format detail`) and *mapper* output formats are auto-detected.
+
+```
+sample_id	fna_path	faa_path	gff_path	kofamscan_path
+genome_001	/data/genome_001.fna	/data/genome_001.faa	/data/genome_001.gff	/data/genome_001_kofamscan.txt
+genome_002	/data/genome_002.fna	/data/genome_002.faa	/data/genome_002.gff
+```
+
+When `kofamscan_path` is provided for some samples, those samples use the pre-computed results. For the remaining samples, KOfamscan runs automatically if `--ko-profiles-dir` is set.
 
 ```bash
 shufflonfinder \
@@ -158,6 +200,8 @@ The directory can contain `.hmm` or `.hmm.gz` files. Each file should hold one H
 --cluster-distance INT    Max gap between IR pairs for chaining into one cluster (default: 1000)
 --min-ir-density FLOAT    Minimum IR pairs per kilobase in a cluster (default: 1.0)
 --skip-prokka         Skip Prokka even for FASTA inputs
+--ko-profiles-dir PATH  KOfamscan profile directory (must contain profiles/ and ko_list)
+--skip-kofamscan      Skip KOfamscan when --ko-profiles-dir is set (use sample sheet paths)
 -v                    Verbose output (use -vv for debug)
 -q                    Quiet mode (errors only)
 ```
@@ -202,6 +246,17 @@ results/
             │   └── <sample_id>_contig_*_window_*.gff
             └── plots/                         # Per-window .png and .svg plots
                 └── <sample_id>_contig_*_window_*.png
+    ├── 08_kofamscan/                          # KOfamscan output (when enabled)
+    │   └── <sample_id>_kofamscan.txt
+    └── 09_kegg_enrichment/                    # KEGG enrichment results
+        ├── <sample_id>_ir_cds_ko.tsv          # IR-overlapping CDS with KO accessions
+        ├── <sample_id>_inverton_pathway_enrichment.tsv
+        ├── <sample_id>_inverton_module_enrichment.tsv
+        └── plots/
+            ├── <sample_id>_inverton_pathway_enrichment.png
+            ├── <sample_id>_inverton_pathway_enrichment.svg
+            ├── <sample_id>_inverton_module_enrichment.png
+            └── <sample_id>_inverton_module_enrichment.svg
 ```
 
 ### Key output files
@@ -219,6 +274,14 @@ results/
 `07_shufflon_windows/shufflon_like/gffs/` and `inverton_like/gffs/` each contain one GFF+FASTA file per detected window. Each GFF has four annotation tracks: `inverted_repeat` features (from einverted or motif_search, named `inverted_repeat_NN_FOR`/`inverted_repeat_NN_REV`), `hmm_hit` features (the recombinase gene), `CDS` features (overlapping Prokka genes), and `invertible_segment` features (the DNA between consecutive IR arms).
 
 `07_shufflon_windows/shufflon_like/plots/` and `inverton_like/plots/` contain PNG and SVG gene-organisation figures for each window. Each figure has three visual tracks: inverted repeats (each pair in a distinct colour) as directional arrows above the annotation line, CDS and recombinase as directional arrows on the main line, and invertible segments as undirectional boxes below. Features are identified by colour via a shared legend rather than inline labels.
+
+`08_kofamscan/<sample_id>_kofamscan.txt` contains the KOfamscan output in detail format. Only present when `--ko-profiles-dir` is used and KOfamscan is run (not when pre-computed results are supplied).
+
+`09_kegg_enrichment/<sample_id>_ir_cds_ko.tsv` lists every CDS that overlaps at least one inverted repeat arm within a shufflon-like or inverton-like window. Columns include `sample_id`, `window_id`, `contig`, `locus_tag`, `cds_start`, `cds_end`, `strand`, `product`, `ko_accession`, and `category` (`shufflon_like` or `inverton_like`).
+
+`09_kegg_enrichment/<sample_id>_inverton_pathway_enrichment.tsv` and `_module_enrichment.tsv` contain the hypergeometric enrichment results for KEGG pathways and modules respectively. Columns: `term_id`, `term_name`, `k` (observed count), `M` (population size), `n` (term size in population), `N` (sample size), `fold_change`, `pvalue`, `padj` (BH-corrected), `neg_log10_pval`. Enrichment uses all KO-annotated CDS in the genome as the background set.
+
+`09_kegg_enrichment/plots/` contains horizontal bar plots (PNG and SVG) for enriched KEGG pathways and modules among inverton-associated CDS. Bars show `-log10(p-value) × fold-change`, coloured by fold change, with count annotations (`k/n`).
 
 
 ## HMM profiles
@@ -279,6 +342,8 @@ shufflonfinder/
 │   ├── step_ir_cds.py           # IR-CDS containment annotation
 │   ├── step_gff.py              # GFF generation, merging, window extraction
 │   ├── step_clinker.py          # Gene-organisation plot generation
+│   ├── step_kofamscan.py        # KOfamscan wrapper and parser
+│   ├── step_kegg_enrichment.py  # KEGG pathway/module enrichment
 │   └── hmms/                    # Bundled HMM profiles (.hmm.gz)
 ├── pyproject.toml               # Package metadata + console_scripts
 ├── environment.yml              # Conda + pip environment
@@ -290,3 +355,4 @@ shufflonfinder/
 ## License
 
 MIT
+
