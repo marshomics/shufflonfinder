@@ -146,8 +146,16 @@ def ir_to_gff(ir_df: pd.DataFrame, output_dir: str) -> dict[str, str]:
                     cluster_attr = f";cluster_id={row['cluster_id']}"
                 source = "motif_search" if is_unpaired else "einverted"
                 # Left (forward) IR — skip if unpaired R-site
-                has_left = pd.notna(row.get("LeftIRStart")) and row.get("LeftIRSequence", "") != ""
-                has_right = pd.notna(row.get("RightIRStart")) and row.get("RightIRSequence", "") != ""
+                has_left = (
+                    pd.notna(row.get("LeftIRStart"))
+                    and pd.notna(row.get("LeftIRStop"))
+                    and row.get("LeftIRSequence", "") != ""
+                )
+                has_right = (
+                    pd.notna(row.get("RightIRStart"))
+                    and pd.notna(row.get("RightIRStop"))
+                    and row.get("RightIRSequence", "") != ""
+                )
                 if has_left:
                     writer.writerow([
                         row["IR_Chr"], source, "inverted_repeat",
