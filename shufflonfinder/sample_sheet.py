@@ -12,10 +12,11 @@ logger = logging.getLogger("shufflonfinder")
 class Sample:
     """Represents one genome sample flowing through the pipeline."""
     sample_id: str
-    fna_path: str = ""        # nucleotide FASTA
-    faa_path: str = ""        # protein FASTA (Prokka output)
-    gff_path: str = ""        # GFF3 annotation (Prokka output)
-    needs_prokka: bool = True  # True if Prokka has not been run yet
+    fna_path: str = ""            # nucleotide FASTA
+    faa_path: str = ""            # protein FASTA (Prokka output)
+    gff_path: str = ""            # GFF3 annotation (Prokka output)
+    kofamscan_path: str = ""      # pre-computed KOfamscan output (optional)
+    needs_prokka: bool = True     # True if Prokka has not been run yet
 
     def validate(self) -> None:
         """Check that all required file paths exist."""
@@ -46,12 +47,18 @@ def load_sample_sheet(tsv_path: str) -> list[Sample]:
                 f"Sample sheet is missing required columns: {missing}"
             )
 
+        has_kofamscan = "kofamscan_path" in (reader.fieldnames or [])
+
         for i, row in enumerate(reader, start=2):
+            kofamscan = ""
+            if has_kofamscan and row.get("kofamscan_path", "").strip():
+                kofamscan = os.path.abspath(row["kofamscan_path"].strip())
             sample = Sample(
                 sample_id=row["sample_id"].strip(),
                 fna_path=os.path.abspath(row["fna_path"].strip()),
                 faa_path=os.path.abspath(row["faa_path"].strip()),
                 gff_path=os.path.abspath(row["gff_path"].strip()),
+                kofamscan_path=kofamscan,
                 needs_prokka=False,
             )
             sample.validate()
