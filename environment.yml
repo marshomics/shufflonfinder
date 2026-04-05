@@ -10,7 +10,6 @@ dependencies:
   - biopython>=1.80
   - pandas>=1.5
   - matplotlib>=3.5
-  - scipy>=1.9
   - pip
   - pip:
     - dna_features_viewer>=3.1
