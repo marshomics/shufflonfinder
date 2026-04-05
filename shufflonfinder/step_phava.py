@@ -30,12 +30,21 @@ _COORD_DEDUP_TOLERANCE = 3
 
 @dataclass
 class InvertedRepeat:
-    """One pair of inverted repeat arms detected by einverted."""
+    """One pair of inverted repeat arms detected by einverted.
+
+    Coordinate convention: half-open intervals (0-based start, exclusive end).
+    This matches Python slice semantics, so ``seq[left_start:left_stop]``
+    yields the left arm sequence directly.
+
+    einverted outputs 1-based inclusive coordinates.  The parser converts
+    them: start is decremented by 1 (to 0-based), stop is kept as-is
+    (1-based inclusive == 0-based exclusive for the same position).
+    """
     chrom: str
-    left_start: int   # 0-based
-    left_stop: int     # 1-based
-    right_start: int   # 0-based
-    right_stop: int    # 1-based
+    left_start: int   # 0-based inclusive
+    left_stop: int     # 0-based exclusive (== 1-based inclusive)
+    right_start: int   # 0-based inclusive
+    right_stop: int    # 0-based exclusive (== 1-based inclusive)
     left_seq: str = ""
     right_seq: str = ""
     middle_seq: str = ""
@@ -117,7 +126,9 @@ def _parse_einverted_outfile(path: str) -> list[tuple[str, int, int, int, int]]:
         line 4: "<right_stop>  <seq>  <right_start>"
 
     Returns list of (chrom, left_start, left_stop, right_start, right_stop)
-    with 0-based start, 1-based stop.
+    using half-open intervals: 0-based start, exclusive end.  (The end
+    value equals the 1-based inclusive coordinate from einverted, which is
+    numerically identical to 0-based exclusive.)
     """
     if not os.path.isfile(path):
         return []
@@ -360,7 +371,7 @@ def load_ir_table(ir_dir: str) -> pd.DataFrame:
 
     ir_path = os.path.join(ir_dir, "data", "IRs.tsv")
     if not os.path.isfile(ir_path):
-        logger.warning("No IRs.tsv found at %s", ir_path)
+        logger.info("No IRs.tsv found at %s (no inverted repeats detected)", ir_path)
         return pd.DataFrame()
 
     df = pd.read_csv(ir_path, sep="\t", dtype={"IR_Chr": str})
@@ -564,9 +575,10 @@ def _deduplicate_ir_by_coords(ir_df: pd.DataFrame) -> pd.DataFrame:
 
     before = len(ir_df)
 
-    # Merge metadata fields for duplicate groups, then recombine
-    # with coordinate columns to avoid groupby index issues.
-    meta_merge = {"hmm_profiles": [], "locus_tag": [], "hit_id": []}
+    # Merge metadata fields for duplicate groups.  We use a dict keyed
+    # by the representative row's original index so that metadata stays
+    # aligned with its coordinate row regardless of iteration order.
+    meta_merge: dict[int, dict[str, str]] = {}
     keep_rows = []
 
     for _key, group in ir_df.groupby(coord_cols, sort=False):
@@ -574,6 +586,7 @@ def _deduplicate_ir_by_coords(ir_df: pd.DataFrame) -> pd.DataFrame:
         rep = group.index[0]
         keep_rows.append(rep)
 
+        merged = {}
         # Merge metadata from all duplicates
         if "hmm_profiles" in ir_df.columns:
             all_profiles = set()
@@ -582,20 +595,26 @@ def _deduplicate_ir_by_coords(ir_df: pd.DataFrame) -> pd.DataFrame:
                     p = p.strip()
                     if p:
                         all_profiles.add(p)
-            meta_merge["hmm_profiles"].append(";".join(sorted(all_profiles)))
+            merged["hmm_profiles"] = ";".join(sorted(all_profiles))
         if "locus_tag" in ir_df.columns:
             tags = sorted(set(group["locus_tag"].dropna().astype(str)))
-            meta_merge["locus_tag"].append(";".join(tags))
+            merged["locus_tag"] = ";".join(tags)
         if "hit_id" in ir_df.columns:
             ids = sorted(set(group["hit_id"].dropna().astype(str)))
-            meta_merge["hit_id"].append(";".join(ids))
+            merged["hit_id"] = ";".join(ids)
+
+        meta_merge[rep] = merged
 
     deduped = ir_df.loc[keep_rows].copy().reset_index(drop=True)
 
-    # Overwrite merged metadata columns
+    # Overwrite merged metadata columns using index-safe assignment.
+    # deduped has been reset_index'd, so we iterate keep_rows in the
+    # same order to build aligned lists.
     for col in ("hmm_profiles", "locus_tag", "hit_id"):
-        if col in deduped.columns and meta_merge[col]:
-            deduped[col] = meta_merge[col]
+        if col in deduped.columns:
+            values = [meta_merge[rep].get(col, "") for rep in keep_rows]
+            if any(values):
+                deduped[col] = values
 
     removed = before - len(deduped)
     if removed:
@@ -694,7 +713,18 @@ def _cluster_density(ir_df: pd.DataFrame, cluster_idx: list[int]) -> float:
     spans = [_ir_span(ir_df.loc[idx]) for idx in cluster_idx]
     cluster_start = min(s[0] for s in spans)
     cluster_end = max(s[1] for s in spans)
-    span_kb = max((cluster_end - cluster_start) / 1000.0, 0.001)
+
+    if cluster_end <= cluster_start:
+        # All pairs share identical coordinates (likely the same physical
+        # site detected multiple times).  Treat as infinitely dense so
+        # they pass density filters, but log for visibility.
+        logger.debug(
+            "IR cluster has zero-length span (%d-%d); treating as infinite density",
+            cluster_start, cluster_end,
+        )
+        return float("inf")
+
+    span_kb = (cluster_end - cluster_start) / 1000.0
     return len(cluster_idx) / span_kb
 
 
@@ -1023,8 +1053,12 @@ def refine_sfx_sites(
         if not arm_lengths:
             # All pairs are extended; fall back to core length + 6
             # (typical sfx site is core + 6bp extension)
+            logger.debug(
+                "Cluster %s: all %d pairs are extended, using fallback site_len=%d",
+                cluster_id, len(cluster), len(core) + 6,
+            )
             arm_lengths = [len(core) + 6]
-        site_len = min(arm_lengths)
+        site_len = max(min(arm_lengths), len(core))
 
         # Collect existing R-arm RCs and F-arm sequences for partner matching.
         # This lets us determine the correct offset of the core within a site
@@ -1043,12 +1077,15 @@ def refine_sfx_sites(
             Returns (site_start, site_end, site_seq, best_identity) or None.
             """
             best = None
+            min_window = int(site_len * 0.8)  # allow 20% tolerance at edges
             # The core can appear at any offset 0..site_len-len(core)
             for offset in range(max(1, site_len - len(core) + 1)):
                 s = core_genome_pos - offset
                 e = s + site_len
                 s = max(0, s)
                 e = min(len(seq), e)
+                if e - s < min_window:
+                    continue  # clipped too short near sequence boundary
                 if _overlaps_existing(s, e):
                     continue
                 candidate = seq[s:e]
