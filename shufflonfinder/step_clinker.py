@@ -404,12 +404,12 @@ def generate_shufflon_plot(gff_path: str, output_dir: str) -> list[str]:
 
     features, sequences = _parse_window_gff(gff_path)
     if not features or not sequences:
-        logger.warning("No features or sequences in %s, skipping plot", gff_path)
+        logger.info("No features or sequences in %s, skipping plot", gff_path)
         return []
 
     classified = _classify_features(features)
     if not classified:
-        logger.warning("No classifiable features in %s, skipping plot", gff_path)
+        logger.info("No classifiable features in %s, skipping plot", gff_path)
         return []
 
     seq_length = len(next(iter(sequences.values())))
